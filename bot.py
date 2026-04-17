@@ -7,9 +7,9 @@ from datetime import datetime, timezone
 import pandas as pd
 import requests
 
-TOKEN = os.getenv("8670855189:AAGJq69MG1e1GnURfSqr5nIj8THXpXwXxaw", "").strip()
-CHAT_ID = os.getenv("8670855189", "").strip()
-TWELVE_DATA_API_KEY = os.getenv("43ec0e0e2bc94a6d937879ee172621d8", "").strip()
+TOKEN = "8670855189:AAGJq69MG1e1GnURfSqr5nIj8THXpXwXxaw"
+CHAT_ID = "8670855189"
+TWELVE_DATA_API_KEY = "43ec0e0e2bc94a6d937879ee172621d8"
 TWELVE_DATA_BASE_URL = "https://api.twelvedata.com"
 
 pairs = {
