@@ -173,8 +173,10 @@ def twelve_data_get(path: str, params: Optional[Dict] = None) -> Dict:
     return payload
 
 def get_history(symbol: str, period: str, interval: str) -> Optional[pd.DataFrame]:
+    """Fetch historical candles and return as DataFrame."""
     try:
-        outputsize_map = {"15m": 300, "1h": 300, "5m": 300}
+        # Fixed: Use proper Twelve Data interval format
+        outputsize_map = {"15min": 300, "1h": 300, "5min": 300}
         payload = twelve_data_get("/time_series", {
             "symbol": symbol,
             "interval": interval,
@@ -187,16 +189,25 @@ def get_history(symbol: str, period: str, interval: str) -> Optional[pd.DataFram
         return None
 
     values = payload.get("values", [])
+    if not values:
+        logger.warning(f"No historical data returned for {symbol}")
+        return None
+        
     rows = []
     for candle in reversed(values):
-        rows.append({
-            "time": candle["datetime"],
-            "Open": float(candle["open"]),
-            "High": float(candle["high"]),
-            "Low": float(candle["low"]),
-            "Close": float(candle["close"]),
-            "Volume": float(candle.get("volume", 0) or 0),
-        })
+        try:
+            rows.append({
+                "time": candle["datetime"],
+                "Open": float(candle["open"]),
+                "High": float(candle["high"]),
+                "Low": float(candle["low"]),
+                "Close": float(candle["close"]),
+                "Volume": float(candle.get("volume", 0) or 0),
+            })
+        except (KeyError, ValueError) as e:
+            logger.warning(f"Skipping malformed candle for {symbol}: {e}")
+            continue
+            
     if not rows:
         return None
     df = pd.DataFrame(rows)
@@ -379,13 +390,15 @@ def calculate_position_size(entry: float, sl: float) -> float:
 
 # -------------------- Signal Generation --------------------
 def build_signal(name: str, symbol: str) -> Optional[Dict]:
-    data_15m = get_history(symbol, period="10d", interval="15m")
+    # Fixed: Use proper Twelve Data interval format "15min" instead of "15m"
+    data_15m = get_history(symbol, period="10d", interval="15min")
     data_1h = get_history(symbol, period="20d", interval="1h")
     live = get_live_price(symbol)
 
     if data_15m is None or data_1h is None or live is None:
         return None
     if len(data_15m) < 80 or len(data_1h) < 80:
+        logger.info(f"Insufficient data for {symbol}: 15min={len(data_15m) if data_15m is not None else 0}, 1h={len(data_1h) if data_1h is not None else 0}")
         return None
 
     close_15m = data_15m["Close"]
@@ -422,6 +435,7 @@ def build_signal(name: str, symbol: str) -> Optional[Dict]:
     if not live["tradeable"]:
         return None
     if live["spread"] > latest_atr * MAX_SPREAD_TO_ATR_RATIO:
+        logger.info(f"{symbol} spread too high: {live['spread']} > {latest_atr * MAX_SPREAD_TO_ATR_RATIO}")
         return None
 
     trend_gap = abs(latest_ema20_15m - latest_ema50_15m)
@@ -552,10 +566,12 @@ def update_trade_status(trade: Dict, latest_price: float):
             new_sl = latest_price - trail_distance
             if new_sl > trade["sl"]:
                 trade["sl"] = round(new_sl, 5)
+                logger.info(f"{trade['pair']} trailing stop updated to {trade['sl']}")
         else:
             new_sl = latest_price + trail_distance
             if new_sl < trade["sl"]:
                 trade["sl"] = round(new_sl, 5)
+                logger.info(f"{trade['pair']} trailing stop updated to {trade['sl']}")
         save_open_state()
 
     if trade["type"] == "BUY":
@@ -603,6 +619,7 @@ def scan_market():
         sig = build_signal(name, symbol)
         if sig:
             signals.append(sig)
+            logger.info(f"Signal generated for {name}")
 
     if not signals:
         logger.info("No valid signals this cycle.")
@@ -639,6 +656,9 @@ def run_bot():
     setup_files()
     load_state()
     logger.info("Bot started. Equity: %.2f, Wins: %d, Losses: %d", current_equity, wins, losses)
+    
+    # Send startup message
+    send_telegram(f"🚀 Bot Started\nEquity: {round(current_equity,2)}\nTime: {now_utc().strftime('%Y-%m-%d %H:%M:%S')} UTC")
 
     last_scan = 0
     last_heartbeat = 0
@@ -674,6 +694,6 @@ def run_bot():
 
 if __name__ == "__main__":
     if not TWELVE_DATA_API_KEY:
-        logger.error("TWELVE_DATA_API_KEY missing.")
+        logger.error("TWELVE_DATA_API_KEY missing. Please set it in environment variables.")
         exit(1)
     run_bot()
