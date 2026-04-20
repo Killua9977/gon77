@@ -3,12 +3,11 @@ import logging
 import math
 import os
 import time
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone
 from typing import Dict, List, Optional, Any
 
 import pandas as pd
 import requests
-from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 
 # -------------------- Configuration --------------------
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
@@ -16,7 +15,7 @@ CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 TWELVE_DATA_API_KEY = os.getenv("TWELVE_DATA_API_KEY", "").strip()
 TWELVE_DATA_BASE_URL = "https://api.twelvedata.com"
 
-# Strategy Parameters (can be overridden by env)
+# Strategy Parameters
 INITIAL_EQUITY = float(os.getenv("INITIAL_EQUITY", "1000.0"))
 RISK_PERCENT = float(os.getenv("RISK_PERCENT", "2.0"))
 MAX_ACTIVE_TRADES = int(os.getenv("MAX_ACTIVE_TRADES", "3"))
@@ -25,10 +24,10 @@ ATR_TARGET_MULTIPLIER = float(os.getenv("ATR_TARGET_MULTIPLIER", "2.4"))
 BREAK_EVEN_TRIGGER_R = float(os.getenv("BREAK_EVEN_TRIGGER_R", "1.0"))
 TRAILING_STOP_ATR_MULTIPLIER = float(os.getenv("TRAILING_STOP_ATR_MULTIPLIER", "1.2"))
 MAX_SPREAD_TO_ATR_RATIO = float(os.getenv("MAX_SPREAD_TO_ATR_RATIO", "0.12"))
-PAIR_COOLDOWN_SECONDS = int(os.getenv("PAIR_COOLDOWN_SECONDS", "14400"))  # 4 hours
+PAIR_COOLDOWN_SECONDS = int(os.getenv("PAIR_COOLDOWN_SECONDS", "14400"))
 
 # Timing
-SCAN_INTERVAL_SECONDS = int(os.getenv("SCAN_INTERVAL_SECONDS", "900"))      # 15 minutes
+SCAN_INTERVAL_SECONDS = int(os.getenv("SCAN_INTERVAL_SECONDS", "900"))
 TRADE_CHECK_INTERVAL_SECONDS = int(os.getenv("TRADE_CHECK_INTERVAL_SECONDS", "20"))
 HEARTBEAT_INTERVAL_SECONDS = int(os.getenv("HEARTBEAT_INTERVAL_SECONDS", "1800"))
 REPORT_INTERVAL_SECONDS = int(os.getenv("REPORT_INTERVAL_SECONDS", "3600"))
@@ -37,7 +36,6 @@ STATE_FILE = "trade_state.csv"
 RESULTS_FILE = "trade_results.csv"
 LOG_FILE = "bot.log"
 
-# Currency Pairs
 pairs = {
     "EURUSD": "EUR/USD",
     "GBPUSD": "GBP/USD",
@@ -62,15 +60,32 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# -------------------- Rate Limiter for Twelve Data --------------------
+# -------------------- Manual Retry Logic --------------------
+def retry_on_failure(max_attempts=3, initial_wait=2, max_wait=10):
+    """Simple retry decorator."""
+    def decorator(func):
+        def wrapper(*args, **kwargs):
+            wait_time = initial_wait
+            for attempt in range(max_attempts):
+                try:
+                    return func(*args, **kwargs)
+                except (requests.RequestException, RuntimeError) as e:
+                    if attempt == max_attempts - 1:
+                        raise
+                    logger.warning(f"Attempt {attempt + 1} failed: {e}. Retrying in {wait_time}s...")
+                    time.sleep(wait_time)
+                    wait_time = min(wait_time * 2, max_wait)
+            return None
+        return wrapper
+    return decorator
+
+# -------------------- Rate Limiter --------------------
 class RateLimiter:
-    """Simple token bucket for API calls (max 8 per minute for free tier)."""
     def __init__(self, max_calls: int = 8, period: float = 60.0):
         self.max_calls = max_calls
         self.period = period
         self.tokens = max_calls
         self.last_refill = time.monotonic()
-        self.lock = False
 
     def _refill(self):
         now = time.monotonic()
@@ -90,7 +105,6 @@ class RateLimiter:
 _rate_limiter = RateLimiter()
 
 def rate_limited_request(method: str, url: str, **kwargs) -> requests.Response:
-    """Make an HTTP request respecting Twelve Data rate limits."""
     _rate_limiter.acquire()
     response = requests.request(method, url, **kwargs)
     response.raise_for_status()
@@ -120,7 +134,6 @@ def now_utc():
     return datetime.now(timezone.utc)
 
 def send_telegram(message: str):
-    """Send a message via Telegram bot."""
     if not TOKEN or not CHAT_ID:
         logger.warning("Telegram not configured; message not sent: %s", message)
         return
@@ -133,40 +146,21 @@ def send_telegram(message: str):
 
 # -------------------- Broker Abstraction --------------------
 class Broker:
-    """Abstract broker interface. Implement for real broker."""
     def place_order(self, symbol: str, order_type: str, units: float,
                     entry: float, sl: float, tp: float) -> Optional[str]:
-        """Return order ID or None if failed."""
-        raise NotImplementedError
-
-    def get_positions(self) -> List[Dict[str, Any]]:
-        """Return list of open positions from broker."""
-        raise NotImplementedError
-
-    def close_position(self, position_id: str) -> bool:
-        """Close a specific position."""
         raise NotImplementedError
 
 class SimulationBroker(Broker):
-    """Simulated broker for testing."""
     def place_order(self, symbol: str, order_type: str, units: float,
                     entry: float, sl: float, tp: float) -> Optional[str]:
-        logger.info("SIMULATION: Placed %s order for %s units of %s at %s", order_type, units, symbol, entry)
+        logger.info("SIMULATION: Placed %s order for %s units of %s at %s", 
+                   order_type, units, symbol, entry)
         return "SIM-" + str(int(time.time()))
 
-    def get_positions(self) -> List[Dict[str, Any]]:
-        return []
-
-    def close_position(self, position_id: str) -> bool:
-        return True
-
-# Global broker instance (replace with real broker class when ready)
 broker = SimulationBroker()
 
-# -------------------- Twelve Data API with Retry --------------------
-@retry(stop=stop_after_attempt(3),
-       wait=wait_exponential(multiplier=1, min=2, max=10),
-       retry=retry_if_exception_type((requests.RequestException, RuntimeError)))
+# -------------------- Twelve Data API --------------------
+@retry_on_failure(max_attempts=3, initial_wait=2, max_wait=10)
 def twelve_data_get(path: str, params: Optional[Dict] = None) -> Dict:
     if not TWELVE_DATA_API_KEY:
         raise RuntimeError("Missing TWELVE_DATA_API_KEY")
@@ -179,7 +173,6 @@ def twelve_data_get(path: str, params: Optional[Dict] = None) -> Dict:
     return payload
 
 def get_history(symbol: str, period: str, interval: str) -> Optional[pd.DataFrame]:
-    """Fetch historical candles and return as DataFrame."""
     try:
         outputsize_map = {"15m": 300, "1h": 300, "5m": 300}
         payload = twelve_data_get("/time_series", {
@@ -212,7 +205,6 @@ def get_history(symbol: str, period: str, interval: str) -> Optional[pd.DataFram
     return df.dropna()
 
 def get_live_price(symbol: str) -> Optional[Dict]:
-    """Get current bid/ask/mid for a symbol."""
     try:
         payload = twelve_data_get("/quote", {"symbol": symbol, "interval": "1min"})
     except Exception as e:
@@ -256,14 +248,13 @@ def calculate_atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
 
 # -------------------- Session Filter --------------------
 def in_optimal_session() -> bool:
-    """Return True during London/NY overlap (12:00–16:00 UTC Mon-Fri)."""
     now = now_utc()
-    if now.weekday() >= 5:  # Saturday or Sunday
+    if now.weekday() >= 5:
         return False
     return 12 <= now.hour < 16
 
 # -------------------- Global State --------------------
-trades: List[Dict] = []          # All trades (open/closed)
+trades: List[Dict] = []
 current_equity = INITIAL_EQUITY
 wins = 0
 losses = 0
@@ -271,7 +262,6 @@ last_trade_times: Dict[str, float] = {}
 
 # -------------------- State Persistence --------------------
 def load_state():
-    """Load open trades and last_trade_times from STATE_FILE."""
     global trades, last_trade_times, current_equity, wins, losses
     if not os.path.exists(STATE_FILE):
         return
@@ -297,10 +287,8 @@ def load_state():
                 "broker_order_id": row.get("broker_order_id", None),
             }
             trades.append(trade)
-            # Update last_trade_time from opened_at
             last_trade_times[trade["pair"]] = trade["opened_at"]
 
-    # Load wins/losses and current_equity from RESULTS_FILE
     if os.path.exists(RESULTS_FILE):
         with open(RESULTS_FILE, mode="r", encoding="utf-8") as f:
             reader = csv.DictReader(f)
@@ -309,7 +297,6 @@ def load_state():
                     wins += 1
                 elif row["status"] == "LOSS":
                     losses += 1
-                # last row's equity_after is current equity
                 equity_str = row.get("equity_after")
                 if equity_str:
                     current_equity = float(equity_str)
@@ -318,7 +305,6 @@ def load_state():
                 len([t for t in trades if t["status"] == "OPEN"]), current_equity, wins, losses)
 
 def save_open_state():
-    """Save currently open trades to STATE_FILE."""
     with open(STATE_FILE, mode="w", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
         writer.writerow([
@@ -335,7 +321,6 @@ def save_open_state():
                 ])
 
 def save_trade_result(trade: Dict, status: str, exit_price: float):
-    """Record closed trade and update equity."""
     global current_equity, wins, losses
 
     risk = trade["risk_per_unit"]
@@ -394,7 +379,6 @@ def calculate_position_size(entry: float, sl: float) -> float:
 
 # -------------------- Signal Generation --------------------
 def build_signal(name: str, symbol: str) -> Optional[Dict]:
-    """Analyze market and return trade signal if conditions met."""
     data_15m = get_history(symbol, period="10d", interval="15m")
     data_1h = get_history(symbol, period="20d", interval="1h")
     live = get_live_price(symbol)
@@ -495,7 +479,6 @@ def build_signal(name: str, symbol: str) -> Optional[Dict]:
     }
 
 def open_trade(signal: Dict):
-    """Open a new trade: place order via broker, record state."""
     order_id = broker.place_order(
         symbol=signal["symbol"],
         order_type=signal["type"],
@@ -541,7 +524,6 @@ def open_trade(signal: Dict):
     )
 
 def update_trade_status(trade: Dict, latest_price: float):
-    """Check if SL/TP hit and apply trailing stop."""
     if trade["status"] != "OPEN":
         return
 
@@ -550,13 +532,11 @@ def update_trade_status(trade: Dict, latest_price: float):
     if risk <= 0 or entry_atr <= 0:
         return
 
-    # Calculate current progress in R
     if trade["type"] == "BUY":
         progress_r = (latest_price - trade["entry"]) / risk
     else:
         progress_r = (trade["entry"] - latest_price) / risk
 
-    # Break-even move
     if progress_r >= BREAK_EVEN_TRIGGER_R and not trade["break_even_done"]:
         if trade["type"] == "BUY":
             trade["sl"] = max(trade["sl"], trade["entry"])
@@ -566,7 +546,6 @@ def update_trade_status(trade: Dict, latest_price: float):
         send_telegram(f"{trade['pair']} moved to break-even at {trade['sl']}")
         save_open_state()
 
-    # Trailing stop (using entry ATR)
     trail_distance = entry_atr * TRAILING_STOP_ATR_MULTIPLIER
     if trade["break_even_done"]:
         if trade["type"] == "BUY":
@@ -579,7 +558,6 @@ def update_trade_status(trade: Dict, latest_price: float):
                 trade["sl"] = round(new_sl, 5)
         save_open_state()
 
-    # Check exit conditions
     if trade["type"] == "BUY":
         if latest_price >= trade["tp"]:
             trade["status"] = "WIN"
@@ -596,8 +574,7 @@ def update_trade_status(trade: Dict, latest_price: float):
             save_trade_result(trade, "LOSS", latest_price)
 
 def check_trades():
-    """Monitor open trades and update status."""
-    for trade in list(trades):  # iterate copy since we may modify
+    for trade in list(trades):
         if trade["status"] != "OPEN":
             continue
         live = get_live_price(trade["symbol"])
@@ -608,13 +585,10 @@ def check_trades():
             continue
         update_trade_status(trade, price)
 
-    # Remove closed trades from active list? We keep them for history but they stay in 'trades' list.
-    # They are ignored because status != "OPEN".
     save_open_state()
 
 # -------------------- Scanning --------------------
 def scan_market():
-    """Look for new trade opportunities."""
     if not in_optimal_session():
         logger.info("Market scan skipped: outside preferred session.")
         return
@@ -634,7 +608,6 @@ def scan_market():
         logger.info("No valid signals this cycle.")
         return
 
-    # Open up to MAX_ACTIVE_TRADES
     slots = MAX_ACTIVE_TRADES - active_trade_count()
     for sig in signals[:slots]:
         open_trade(sig)
@@ -697,10 +670,9 @@ def run_bot():
             logger.exception("Unhandled error in main loop: %s", e)
             send_telegram(f"⚠️ Bot error: {e}")
 
-        time.sleep(1)  # short sleep to yield CPU
+        time.sleep(1)
 
 if __name__ == "__main__":
-    # Check essential environment variables
     if not TWELVE_DATA_API_KEY:
         logger.error("TWELVE_DATA_API_KEY missing.")
         exit(1)
