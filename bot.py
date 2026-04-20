@@ -1,17 +1,43 @@
 import csv
+import logging
 import math
 import os
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
+from typing import Dict, List, Optional, Any
 
 import pandas as pd
 import requests
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 
+# -------------------- Configuration --------------------
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 TWELVE_DATA_API_KEY = os.getenv("TWELVE_DATA_API_KEY", "").strip()
 TWELVE_DATA_BASE_URL = "https://api.twelvedata.com"
 
+# Strategy Parameters (can be overridden by env)
+INITIAL_EQUITY = float(os.getenv("INITIAL_EQUITY", "1000.0"))
+RISK_PERCENT = float(os.getenv("RISK_PERCENT", "2.0"))
+MAX_ACTIVE_TRADES = int(os.getenv("MAX_ACTIVE_TRADES", "3"))
+ATR_STOP_MULTIPLIER = float(os.getenv("ATR_STOP_MULTIPLIER", "1.5"))
+ATR_TARGET_MULTIPLIER = float(os.getenv("ATR_TARGET_MULTIPLIER", "2.4"))
+BREAK_EVEN_TRIGGER_R = float(os.getenv("BREAK_EVEN_TRIGGER_R", "1.0"))
+TRAILING_STOP_ATR_MULTIPLIER = float(os.getenv("TRAILING_STOP_ATR_MULTIPLIER", "1.2"))
+MAX_SPREAD_TO_ATR_RATIO = float(os.getenv("MAX_SPREAD_TO_ATR_RATIO", "0.12"))
+PAIR_COOLDOWN_SECONDS = int(os.getenv("PAIR_COOLDOWN_SECONDS", "14400"))  # 4 hours
+
+# Timing
+SCAN_INTERVAL_SECONDS = int(os.getenv("SCAN_INTERVAL_SECONDS", "900"))      # 15 minutes
+TRADE_CHECK_INTERVAL_SECONDS = int(os.getenv("TRADE_CHECK_INTERVAL_SECONDS", "20"))
+HEARTBEAT_INTERVAL_SECONDS = int(os.getenv("HEARTBEAT_INTERVAL_SECONDS", "1800"))
+REPORT_INTERVAL_SECONDS = int(os.getenv("REPORT_INTERVAL_SECONDS", "3600"))
+
+STATE_FILE = "trade_state.csv"
+RESULTS_FILE = "trade_results.csv"
+LOG_FILE = "bot.log"
+
+# Currency Pairs
 pairs = {
     "EURUSD": "EUR/USD",
     "GBPUSD": "GBP/USD",
@@ -25,323 +51,356 @@ pairs = {
     "GBPJPY": "GBP/JPY",
 }
 
-ACCOUNT_BALANCE = 100.0
-RISK_PERCENT = 2.0
-MAX_ACTIVE_TRADES = 3
-SCAN_INTERVAL_SECONDS = 900
-TRADE_CHECK_INTERVAL_SECONDS = 20
-HEARTBEAT_INTERVAL_SECONDS = 1800
-REPORT_INTERVAL_SECONDS = 3600
-PAIR_COOLDOWN_SECONDS = 4 * 3600
+# -------------------- Logging Setup --------------------
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[
+        logging.FileHandler(LOG_FILE),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger(__name__)
 
-ATR_STOP_MULTIPLIER = 1.5
-ATR_TARGET_MULTIPLIER = 2.4
-BREAK_EVEN_TRIGGER_R = 1.0
-TRAILING_STOP_ATR_MULTIPLIER = 1.2
-MAX_SPREAD_TO_ATR_RATIO = 0.12
+# -------------------- Rate Limiter for Twelve Data --------------------
+class RateLimiter:
+    """Simple token bucket for API calls (max 8 per minute for free tier)."""
+    def __init__(self, max_calls: int = 8, period: float = 60.0):
+        self.max_calls = max_calls
+        self.period = period
+        self.tokens = max_calls
+        self.last_refill = time.monotonic()
+        self.lock = False
 
-STATE_FILE = "trade_state.csv"
-RESULTS_FILE = "trade_results.csv"
+    def _refill(self):
+        now = time.monotonic()
+        elapsed = now - self.last_refill
+        new_tokens = elapsed * (self.max_calls / self.period)
+        self.tokens = min(self.max_calls, self.tokens + new_tokens)
+        self.last_refill = now
 
-trades = []
-wins = 0
-losses = 0
-last_trade_times = {}
+    def acquire(self):
+        while True:
+            self._refill()
+            if self.tokens >= 1:
+                self.tokens -= 1
+                return
+            time.sleep(0.1)
 
+_rate_limiter = RateLimiter()
 
-def ensure_csv(path, headers):
-    if os.path.exists(path):
-        return
+def rate_limited_request(method: str, url: str, **kwargs) -> requests.Response:
+    """Make an HTTP request respecting Twelve Data rate limits."""
+    _rate_limiter.acquire()
+    response = requests.request(method, url, **kwargs)
+    response.raise_for_status()
+    return response
 
-    with open(path, mode="w", newline="", encoding="utf-8") as file:
-        writer = csv.writer(file)
-        writer.writerow(headers)
-
+# -------------------- Helper Functions --------------------
+def ensure_csv(path: str, headers: List[str]):
+    if not os.path.exists(path):
+        with open(path, mode="w", newline="", encoding="utf-8") as f:
+            writer = csv.writer(f)
+            writer.writerow(headers)
 
 def setup_files():
-    ensure_csv(
-        RESULTS_FILE,
-        [
-            "timestamp",
-            "pair",
-            "type",
-            "entry",
-            "sl",
-            "tp",
-            "exit_price",
-            "status",
-            "profit_r",
-        ],
-    )
-    ensure_csv(
-        STATE_FILE,
-        [
-            "pair",
-            "type",
-            "entry",
-            "sl",
-            "tp",
-            "status",
-            "opened_at",
-            "risk_per_unit",
-            "break_even_done",
-            "symbol",
-        ],
-    )
-
+    ensure_csv(RESULTS_FILE, [
+        "timestamp", "pair", "type", "entry", "sl", "tp",
+        "exit_price", "status", "profit_r", "pnl", "equity_after"
+    ])
+    ensure_csv(STATE_FILE, [
+        "pair", "type", "entry", "sl", "tp", "status", "opened_at",
+        "risk_per_unit", "break_even_done", "symbol", "entry_atr", "lot_size"
+    ])
 
 def is_valid_number(value):
     return value is not None and not math.isnan(value) and math.isfinite(value)
 
-
 def now_utc():
     return datetime.now(timezone.utc)
 
-
-def require_twelve_data_key():
-    if not TWELVE_DATA_API_KEY:
-        raise RuntimeError("Missing TWELVE_DATA_API_KEY environment variable.")
-
-
-def require_telegram_config():
-    if not TOKEN:
-        raise RuntimeError("Missing TELEGRAM_BOT_TOKEN environment variable.")
-    if not CHAT_ID:
-        raise RuntimeError("Missing TELEGRAM_CHAT_ID environment variable.")
-
-
-def twelve_data_get(path, params=None):
-    require_twelve_data_key()
-    query = dict(params or {})
-    query["apikey"] = TWELVE_DATA_API_KEY
-    response = requests.get(
-        f"{TWELVE_DATA_BASE_URL}{path}",
-        params=query,
-        timeout=15,
-    )
-    response.raise_for_status()
-    payload = response.json()
-    if payload.get("status") == "error":
-        raise RuntimeError(payload.get("message", "Twelve Data request failed."))
-    return payload
-
-
-def send(message):
+def send_telegram(message: str):
+    """Send a message via Telegram bot."""
+    if not TOKEN or not CHAT_ID:
+        logger.warning("Telegram not configured; message not sent: %s", message)
+        return
     url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
     try:
-        response = requests.post(
-            url,
-            data={"chat_id": CHAT_ID, "text": message},
-            timeout=10,
-        )
-        response.raise_for_status()
-    except requests.RequestException as exc:
-        print(f"Telegram send failed: {exc}")
+        resp = requests.post(url, data={"chat_id": CHAT_ID, "text": message}, timeout=10)
+        resp.raise_for_status()
+    except Exception as e:
+        logger.error("Telegram send failed: %s", e)
 
+# -------------------- Broker Abstraction --------------------
+class Broker:
+    """Abstract broker interface. Implement for real broker."""
+    def place_order(self, symbol: str, order_type: str, units: float,
+                    entry: float, sl: float, tp: float) -> Optional[str]:
+        """Return order ID or None if failed."""
+        raise NotImplementedError
 
-def save_trade_result(trade, status, exit_price):
-    profit_r = 0.0
-    risk = trade["risk_per_unit"]
+    def get_positions(self) -> List[Dict[str, Any]]:
+        """Return list of open positions from broker."""
+        raise NotImplementedError
 
-    if risk > 0:
-        if trade["type"] == "BUY":
-            profit_r = (exit_price - trade["entry"]) / risk
-        else:
-            profit_r = (trade["entry"] - exit_price) / risk
+    def close_position(self, position_id: str) -> bool:
+        """Close a specific position."""
+        raise NotImplementedError
 
-    with open(RESULTS_FILE, mode="a", newline="", encoding="utf-8") as file:
-        writer = csv.writer(file)
-        writer.writerow(
-            [
-                now_utc().isoformat(),
-                trade["pair"],
-                trade["type"],
-                round(trade["entry"], 5),
-                round(trade["sl"], 5),
-                round(trade["tp"], 5),
-                round(exit_price, 5),
-                status,
-                round(profit_r, 2),
-            ]
-        )
+class SimulationBroker(Broker):
+    """Simulated broker for testing."""
+    def place_order(self, symbol: str, order_type: str, units: float,
+                    entry: float, sl: float, tp: float) -> Optional[str]:
+        logger.info("SIMULATION: Placed %s order for %s units of %s at %s", order_type, units, symbol, entry)
+        return "SIM-" + str(int(time.time()))
 
+    def get_positions(self) -> List[Dict[str, Any]]:
+        return []
 
-def save_open_state():
-    with open(STATE_FILE, mode="w", newline="", encoding="utf-8") as file:
-        writer = csv.writer(file)
-        writer.writerow(
-            [
-                "pair",
-                "type",
-                "entry",
-                "sl",
-                "tp",
-                "status",
-                "opened_at",
-                "risk_per_unit",
-                "break_even_done",
-                "symbol",
-            ]
-        )
-        for trade in trades:
-            if trade["status"] == "OPEN":
-                writer.writerow(
-                    [
-                        trade["pair"],
-                        trade["type"],
-                        trade["entry"],
-                        trade["sl"],
-                        trade["tp"],
-                        trade["status"],
-                        trade["opened_at"],
-                        trade["risk_per_unit"],
-                        int(trade["break_even_done"]),
-                        trade["symbol"],
-                    ]
-                )
+    def close_position(self, position_id: str) -> bool:
+        return True
 
+# Global broker instance (replace with real broker class when ready)
+broker = SimulationBroker()
 
-def has_open_trade(pair):
-    return any(
-        trade["pair"] == pair and trade["status"] == "OPEN"
-        for trade in trades
-    )
+# -------------------- Twelve Data API with Retry --------------------
+@retry(stop=stop_after_attempt(3),
+       wait=wait_exponential(multiplier=1, min=2, max=10),
+       retry=retry_if_exception_type((requests.RequestException, RuntimeError)))
+def twelve_data_get(path: str, params: Optional[Dict] = None) -> Dict:
+    if not TWELVE_DATA_API_KEY:
+        raise RuntimeError("Missing TWELVE_DATA_API_KEY")
+    query = dict(params or {})
+    query["apikey"] = TWELVE_DATA_API_KEY
+    response = rate_limited_request("GET", f"{TWELVE_DATA_BASE_URL}{path}", params=query, timeout=15)
+    payload = response.json()
+    if payload.get("status") == "error":
+        raise RuntimeError(payload.get("message", "Twelve Data error"))
+    return payload
 
-
-def active_trade_count():
-    return sum(1 for trade in trades if trade["status"] == "OPEN")
-
-
-def calculate_position_size(entry, sl):
-    risk_amount = ACCOUNT_BALANCE * (RISK_PERCENT / 100)
-    sl_distance = abs(entry - sl)
-    if sl_distance <= 0:
-        return 0.0
-    return round(risk_amount / sl_distance, 2)
-
-
-def get_history(symbol, period, interval):
+def get_history(symbol: str, period: str, interval: str) -> Optional[pd.DataFrame]:
+    """Fetch historical candles and return as DataFrame."""
     try:
-        outputsize_map = {
-            "15m": 300,
-            "1h": 300,
-            "5m": 300,
-        }
-        outputsize = outputsize_map[interval]
-        payload = twelve_data_get(
-            "/time_series",
-            params={
-                "symbol": symbol,
-                "interval": interval,
-                "outputsize": outputsize,
-                "timezone": "UTC",
-                "format": "JSON",
-            },
-        )
-    except Exception as exc:
-        print(f"History fetch failed for {symbol}: {exc}")
+        outputsize_map = {"15m": 300, "1h": 300, "5m": 300}
+        payload = twelve_data_get("/time_series", {
+            "symbol": symbol,
+            "interval": interval,
+            "outputsize": outputsize_map.get(interval, 300),
+            "timezone": "UTC",
+            "format": "JSON",
+        })
+    except Exception as e:
+        logger.error("History fetch failed for %s: %s", symbol, e)
         return None
 
     values = payload.get("values", [])
     rows = []
-
     for candle in reversed(values):
-        rows.append(
-            {
-                "time": candle["datetime"],
-                "Open": float(candle["open"]),
-                "High": float(candle["high"]),
-                "Low": float(candle["low"]),
-                "Close": float(candle["close"]),
-                "Volume": float(candle.get("volume", 0) or 0),
-            }
-        )
-
+        rows.append({
+            "time": candle["datetime"],
+            "Open": float(candle["open"]),
+            "High": float(candle["high"]),
+            "Low": float(candle["low"]),
+            "Close": float(candle["close"]),
+            "Volume": float(candle.get("volume", 0) or 0),
+        })
     if not rows:
         return None
+    df = pd.DataFrame(rows)
+    df["time"] = pd.to_datetime(df["time"], utc=True)
+    df.set_index("time", inplace=True)
+    return df.dropna()
 
-    data = pd.DataFrame(rows)
-    data["time"] = pd.to_datetime(data["time"], utc=True)
-    data.set_index("time", inplace=True)
-    return data.dropna()
-
-
-def get_live_price(symbol):
+def get_live_price(symbol: str) -> Optional[Dict]:
+    """Get current bid/ask/mid for a symbol."""
     try:
-        payload = twelve_data_get(
-            "/quote",
-            params={
-                "symbol": symbol,
-                "interval": "1min",
-            },
-        )
-    except Exception as exc:
-        print(f"Pricing fetch failed for {symbol}: {exc}")
+        payload = twelve_data_get("/quote", {"symbol": symbol, "interval": "1min"})
+    except Exception as e:
+        logger.error("Pricing fetch failed for %s: %s", symbol, e)
         return None
 
-    close_price = payload.get("close")
-    if close_price is None:
+    close = payload.get("close")
+    if close is None:
         return None
-
-    mid = float(close_price)
+    mid = float(close)
     ask = float(payload.get("ask", mid))
     bid = float(payload.get("bid", mid))
     if ask < bid:
         ask = mid
         bid = mid
-
-    spread = round(max(ask - bid, 0.0), 5)
-
     return {
         "bid": bid,
         "ask": ask,
         "mid": mid,
-        "spread": spread,
+        "spread": round(max(ask - bid, 0.0), 5),
         "tradeable": True,
     }
 
-
-def calculate_rsi(close, period=14):
-    delta = close.diff()
-    gain = delta.clip(lower=0).ewm(alpha=1 / period, adjust=False).mean()
-    loss = -delta.clip(upper=0).ewm(alpha=1 / period, adjust=False).mean()
+# -------------------- Technical Indicators --------------------
+def calculate_rsi(series: pd.Series, period: int = 14) -> pd.Series:
+    delta = series.diff()
+    gain = delta.clip(lower=0).ewm(alpha=1/period, adjust=False).mean()
+    loss = (-delta.clip(upper=0)).ewm(alpha=1/period, adjust=False).mean()
     loss = loss.replace(0, 1e-10)
     rs = gain / loss
     return 100 - (100 / (1 + rs))
 
-
-def calculate_atr(data, period=14):
-    high = data["High"]
-    low = data["Low"]
-    close = data["Close"]
+def calculate_atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
+    high = df["High"]
+    low = df["Low"]
+    close = df["Close"]
     prev_close = close.shift(1)
+    tr = (high - low).combine((high - prev_close).abs(), max)
+    tr = tr.combine((low - prev_close).abs(), max)
+    return tr.ewm(alpha=1/period, adjust=False).mean()
 
-    true_range = (high - low).combine((high - prev_close).abs(), max)
-    true_range = true_range.combine((low - prev_close).abs(), max)
+# -------------------- Session Filter --------------------
+def in_optimal_session() -> bool:
+    """Return True during London/NY overlap (12:00–16:00 UTC Mon-Fri)."""
+    now = now_utc()
+    if now.weekday() >= 5:  # Saturday or Sunday
+        return False
+    return 12 <= now.hour < 16
 
-    return true_range.ewm(alpha=1 / period, adjust=False).mean()
+# -------------------- Global State --------------------
+trades: List[Dict] = []          # All trades (open/closed)
+current_equity = INITIAL_EQUITY
+wins = 0
+losses = 0
+last_trade_times: Dict[str, float] = {}
 
+# -------------------- State Persistence --------------------
+def load_state():
+    """Load open trades and last_trade_times from STATE_FILE."""
+    global trades, last_trade_times, current_equity, wins, losses
+    if not os.path.exists(STATE_FILE):
+        return
 
-def in_session():
-    hour = now_utc().hour
-    return 6 <= hour <= 20
+    with open(STATE_FILE, mode="r", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            if row["status"] != "OPEN":
+                continue
+            trade = {
+                "pair": row["pair"],
+                "symbol": row["symbol"],
+                "type": row["type"],
+                "entry": float(row["entry"]),
+                "sl": float(row["sl"]),
+                "tp": float(row["tp"]),
+                "status": row["status"],
+                "opened_at": float(row["opened_at"]),
+                "risk_per_unit": float(row["risk_per_unit"]),
+                "break_even_done": row["break_even_done"] == "1",
+                "entry_atr": float(row.get("entry_atr", 0.0)),
+                "lot_size": float(row.get("lot_size", 0.0)),
+                "broker_order_id": row.get("broker_order_id", None),
+            }
+            trades.append(trade)
+            # Update last_trade_time from opened_at
+            last_trade_times[trade["pair"]] = trade["opened_at"]
 
+    # Load wins/losses and current_equity from RESULTS_FILE
+    if os.path.exists(RESULTS_FILE):
+        with open(RESULTS_FILE, mode="r", encoding="utf-8") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                if row["status"] == "WIN":
+                    wins += 1
+                elif row["status"] == "LOSS":
+                    losses += 1
+                # last row's equity_after is current equity
+                equity_str = row.get("equity_after")
+                if equity_str:
+                    current_equity = float(equity_str)
 
-def cooldown_ready(pair):
-    last_trade_time = last_trade_times.get(pair)
-    if last_trade_time is None:
+    logger.info("Loaded %d open trades. Equity: %.2f, Wins: %d, Losses: %d",
+                len([t for t in trades if t["status"] == "OPEN"]), current_equity, wins, losses)
+
+def save_open_state():
+    """Save currently open trades to STATE_FILE."""
+    with open(STATE_FILE, mode="w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerow([
+            "pair", "type", "entry", "sl", "tp", "status", "opened_at",
+            "risk_per_unit", "break_even_done", "symbol", "entry_atr", "lot_size", "broker_order_id"
+        ])
+        for t in trades:
+            if t["status"] == "OPEN":
+                writer.writerow([
+                    t["pair"], t["type"], t["entry"], t["sl"], t["tp"],
+                    t["status"], t["opened_at"], t["risk_per_unit"],
+                    int(t["break_even_done"]), t["symbol"], t["entry_atr"],
+                    t["lot_size"], t.get("broker_order_id", "")
+                ])
+
+def save_trade_result(trade: Dict, status: str, exit_price: float):
+    """Record closed trade and update equity."""
+    global current_equity, wins, losses
+
+    risk = trade["risk_per_unit"]
+    lot_size = trade["lot_size"]
+    if trade["type"] == "BUY":
+        profit = (exit_price - trade["entry"]) * lot_size
+        profit_r = (exit_price - trade["entry"]) / risk if risk > 0 else 0.0
+    else:
+        profit = (trade["entry"] - exit_price) * lot_size
+        profit_r = (trade["entry"] - exit_price) / risk if risk > 0 else 0.0
+
+    current_equity += profit
+
+    with open(RESULTS_FILE, mode="a", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerow([
+            now_utc().isoformat(),
+            trade["pair"],
+            trade["type"],
+            round(trade["entry"], 5),
+            round(trade["sl"], 5),
+            round(trade["tp"], 5),
+            round(exit_price, 5),
+            status,
+            round(profit_r, 2),
+            round(profit, 2),
+            round(current_equity, 2)
+        ])
+
+    if status == "WIN":
+        wins += 1
+    else:
+        losses += 1
+
+    send_telegram(f"{status} {trade['pair']} at {round(exit_price,5)} | PnL: {round(profit,2)} | Equity: {round(current_equity,2)}")
+
+# -------------------- Trade Management --------------------
+def has_open_trade(pair: str) -> bool:
+    return any(t["pair"] == pair and t["status"] == "OPEN" for t in trades)
+
+def active_trade_count() -> int:
+    return sum(1 for t in trades if t["status"] == "OPEN")
+
+def cooldown_ready(pair: str) -> bool:
+    last_time = last_trade_times.get(pair)
+    if last_time is None:
         return True
-    return time.time() - last_trade_time >= PAIR_COOLDOWN_SECONDS
+    return (time.time() - last_time) >= PAIR_COOLDOWN_SECONDS
 
+def calculate_position_size(entry: float, sl: float) -> float:
+    risk_amount = current_equity * (RISK_PERCENT / 100.0)
+    sl_distance = abs(entry - sl)
+    if sl_distance <= 0:
+        return 0.0
+    return round(risk_amount / sl_distance, 2)
 
-def build_signal(name, symbol):
+# -------------------- Signal Generation --------------------
+def build_signal(name: str, symbol: str) -> Optional[Dict]:
+    """Analyze market and return trade signal if conditions met."""
     data_15m = get_history(symbol, period="10d", interval="15m")
     data_1h = get_history(symbol, period="20d", interval="1h")
-    live_price = get_live_price(symbol)
+    live = get_live_price(symbol)
 
-    if data_15m is None or data_1h is None or live_price is None:
+    if data_15m is None or data_1h is None or live is None:
         return None
-
     if len(data_15m) < 80 or len(data_1h) < 80:
         return None
 
@@ -369,32 +428,16 @@ def build_signal(name, symbol):
     previous_high = float(data_15m["High"].iloc[-2])
     previous_low = float(data_15m["Low"].iloc[-2])
 
-    values = [
-        latest_price,
-        prev_price,
-        latest_ema20_15m,
-        prev_ema20_15m,
-        latest_ema50_15m,
-        latest_ema20_1h,
-        latest_ema50_1h,
-        latest_rsi,
-        latest_atr,
-        candle_high,
-        candle_low,
-        previous_high,
-        previous_low,
-    ]
-
-    if not all(is_valid_number(value) for value in values):
+    values = [latest_price, prev_price, latest_ema20_15m, prev_ema20_15m, latest_ema50_15m,
+              latest_ema20_1h, latest_ema50_1h, latest_rsi, latest_atr,
+              candle_high, candle_low, previous_high, previous_low]
+    if not all(is_valid_number(v) for v in values):
         return None
-
     if latest_atr <= 0:
         return None
-
-    if not live_price["tradeable"]:
+    if not live["tradeable"]:
         return None
-
-    if live_price["spread"] > latest_atr * MAX_SPREAD_TO_ATR_RATIO:
+    if live["spread"] > latest_atr * MAX_SPREAD_TO_ATR_RATIO:
         return None
 
     trend_gap = abs(latest_ema20_15m - latest_ema50_15m)
@@ -403,28 +446,23 @@ def build_signal(name, symbol):
 
     signal_type = None
 
-    if (
-        latest_price > latest_ema20_15m > latest_ema50_15m
-        and float(close_1h.iloc[-1]) > latest_ema20_1h > latest_ema50_1h
-        and 52 <= latest_rsi <= 68
-        and prev_price <= prev_ema20_15m * 1.0015
-        and candle_high > previous_high
-    ):
+    if (latest_price > latest_ema20_15m > latest_ema50_15m and
+        float(close_1h.iloc[-1]) > latest_ema20_1h > latest_ema50_1h and
+        52 <= latest_rsi <= 68 and
+        prev_price <= prev_ema20_15m * 1.0015 and
+        candle_high > previous_high):
         signal_type = "BUY"
-
-    elif (
-        latest_price < latest_ema20_15m < latest_ema50_15m
-        and float(close_1h.iloc[-1]) < latest_ema20_1h < latest_ema50_1h
-        and 32 <= latest_rsi <= 48
-        and prev_price >= prev_ema20_15m * 0.9985
-        and candle_low < previous_low
-    ):
+    elif (latest_price < latest_ema20_15m < latest_ema50_15m and
+          float(close_1h.iloc[-1]) < latest_ema20_1h < latest_ema50_1h and
+          32 <= latest_rsi <= 48 and
+          prev_price >= prev_ema20_15m * 0.9985 and
+          candle_low < previous_low):
         signal_type = "SELL"
 
     if signal_type is None:
         return None
 
-    entry = round(live_price["ask"] if signal_type == "BUY" else live_price["bid"], 5)
+    entry = round(live["ask"] if signal_type == "BUY" else live["bid"], 5)
     stop_distance = round(latest_atr * ATR_STOP_MULTIPLIER, 5)
     target_distance = round(latest_atr * ATR_TARGET_MULTIPLIER, 5)
 
@@ -453,11 +491,23 @@ def build_signal(name, symbol):
         "rsi": round(latest_rsi, 2),
         "lot_size": lot_size,
         "risk_per_unit": round(abs(entry - sl), 5),
-        "spread": live_price["spread"],
+        "spread": live["spread"],
     }
 
+def open_trade(signal: Dict):
+    """Open a new trade: place order via broker, record state."""
+    order_id = broker.place_order(
+        symbol=signal["symbol"],
+        order_type=signal["type"],
+        units=signal["lot_size"],
+        entry=signal["entry"],
+        sl=signal["sl"],
+        tp=signal["tp"]
+    )
+    if order_id is None:
+        logger.error("Failed to place order for %s", signal["pair"])
+        return
 
-def open_trade(signal):
     trade = {
         "pair": signal["pair"],
         "symbol": signal["symbol"],
@@ -469,154 +519,153 @@ def open_trade(signal):
         "opened_at": time.time(),
         "risk_per_unit": signal["risk_per_unit"],
         "break_even_done": False,
+        "entry_atr": signal["atr"],
+        "lot_size": signal["lot_size"],
+        "broker_order_id": order_id,
     }
     trades.append(trade)
-    last_trade_times[trade["pair"]] = time.time()
+    last_trade_times[signal["pair"]] = time.time()
     save_open_state()
 
-    send(
-        f"SNIPER SIGNAL\n\n"
-        f"{trade['pair']} {trade['type']}\n"
-        f"Entry: {trade['entry']}\n"
-        f"SL: {trade['sl']}\n"
-        f"TP: {trade['tp']}\n"
+    send_telegram(
+        f"🔔 SNIPER SIGNAL\n\n"
+        f"{signal['pair']} {signal['type']}\n"
+        f"Entry: {signal['entry']}\n"
+        f"SL: {signal['sl']}\n"
+        f"TP: {signal['tp']}\n"
         f"ATR: {signal['atr']}\n"
         f"RSI: {signal['rsi']}\n"
         f"Spread: {signal['spread']}\n"
-        f"Lot Size: {signal['lot_size']}"
+        f"Lot Size: {signal['lot_size']}\n"
+        f"Equity: {round(current_equity,2)}"
     )
 
-
-def update_trade_status(trade, latest_price):
-    global wins, losses
+def update_trade_status(trade: Dict, latest_price: float):
+    """Check if SL/TP hit and apply trailing stop."""
+    if trade["status"] != "OPEN":
+        return
 
     risk = trade["risk_per_unit"]
-    if risk <= 0:
+    entry_atr = trade["entry_atr"]
+    if risk <= 0 or entry_atr <= 0:
         return
 
+    # Calculate current progress in R
     if trade["type"] == "BUY":
         progress_r = (latest_price - trade["entry"]) / risk
-        trailing_sl = round(latest_price - (risk * TRAILING_STOP_ATR_MULTIPLIER), 5)
-
-        if progress_r >= BREAK_EVEN_TRIGGER_R and not trade["break_even_done"]:
-            trade["sl"] = max(trade["sl"], trade["entry"])
-            trade["break_even_done"] = True
-            send(f"{trade['pair']} moved to break-even at {trade['sl']}")
-
-        if trade["break_even_done"]:
-            trade["sl"] = max(trade["sl"], trailing_sl)
-
-        if latest_price >= trade["tp"]:
-            trade["status"] = "WIN"
-            wins += 1
-            save_trade_result(trade, "WIN", latest_price)
-            send(f"WIN {trade['pair']} at {round(latest_price, 5)}")
-
-        elif latest_price <= trade["sl"]:
-            trade["status"] = "LOSS"
-            losses += 1
-            save_trade_result(trade, "LOSS", latest_price)
-            send(f"LOSS {trade['pair']} at {round(latest_price, 5)}")
-
     else:
         progress_r = (trade["entry"] - latest_price) / risk
-        trailing_sl = round(latest_price + (risk * TRAILING_STOP_ATR_MULTIPLIER), 5)
 
-        if progress_r >= BREAK_EVEN_TRIGGER_R and not trade["break_even_done"]:
+    # Break-even move
+    if progress_r >= BREAK_EVEN_TRIGGER_R and not trade["break_even_done"]:
+        if trade["type"] == "BUY":
+            trade["sl"] = max(trade["sl"], trade["entry"])
+        else:
             trade["sl"] = min(trade["sl"], trade["entry"])
-            trade["break_even_done"] = True
-            send(f"{trade['pair']} moved to break-even at {trade['sl']}")
+        trade["break_even_done"] = True
+        send_telegram(f"{trade['pair']} moved to break-even at {trade['sl']}")
+        save_open_state()
 
-        if trade["break_even_done"]:
-            trade["sl"] = min(trade["sl"], trailing_sl)
+    # Trailing stop (using entry ATR)
+    trail_distance = entry_atr * TRAILING_STOP_ATR_MULTIPLIER
+    if trade["break_even_done"]:
+        if trade["type"] == "BUY":
+            new_sl = latest_price - trail_distance
+            if new_sl > trade["sl"]:
+                trade["sl"] = round(new_sl, 5)
+        else:
+            new_sl = latest_price + trail_distance
+            if new_sl < trade["sl"]:
+                trade["sl"] = round(new_sl, 5)
+        save_open_state()
 
+    # Check exit conditions
+    if trade["type"] == "BUY":
+        if latest_price >= trade["tp"]:
+            trade["status"] = "WIN"
+            save_trade_result(trade, "WIN", latest_price)
+        elif latest_price <= trade["sl"]:
+            trade["status"] = "LOSS"
+            save_trade_result(trade, "LOSS", latest_price)
+    else:
         if latest_price <= trade["tp"]:
             trade["status"] = "WIN"
-            wins += 1
             save_trade_result(trade, "WIN", latest_price)
-            send(f"WIN {trade['pair']} at {round(latest_price, 5)}")
-
         elif latest_price >= trade["sl"]:
             trade["status"] = "LOSS"
-            losses += 1
             save_trade_result(trade, "LOSS", latest_price)
-            send(f"LOSS {trade['pair']} at {round(latest_price, 5)}")
-
 
 def check_trades():
-    for trade in trades:
+    """Monitor open trades and update status."""
+    for trade in list(trades):  # iterate copy since we may modify
         if trade["status"] != "OPEN":
             continue
-
-        live_price = get_live_price(trade["symbol"])
-        if live_price is None or not live_price["tradeable"]:
+        live = get_live_price(trade["symbol"])
+        if live is None or not live["tradeable"]:
             continue
-
-        latest_price = live_price["bid"] if trade["type"] == "BUY" else live_price["ask"]
-        if not is_valid_number(latest_price):
+        price = live["bid"] if trade["type"] == "BUY" else live["ask"]
+        if not is_valid_number(price):
             continue
+        update_trade_status(trade, price)
 
-        update_trade_status(trade, latest_price)
-
+    # Remove closed trades from active list? We keep them for history but they stay in 'trades' list.
+    # They are ignored because status != "OPEN".
     save_open_state()
 
-
+# -------------------- Scanning --------------------
 def scan_market():
-    if not in_session():
-        print("Market scan skipped: outside preferred session.")
+    """Look for new trade opportunities."""
+    if not in_optimal_session():
+        logger.info("Market scan skipped: outside preferred session.")
         return
-
     if active_trade_count() >= MAX_ACTIVE_TRADES:
-        print("Market scan skipped: max active trades reached.")
+        logger.info("Market scan skipped: max active trades reached.")
         return
 
     signals = []
-
     for name, symbol in pairs.items():
         if has_open_trade(name) or not cooldown_ready(name):
             continue
-
-        signal = build_signal(name, symbol)
-        if signal is None:
-            continue
-
-        signals.append(signal)
+        sig = build_signal(name, symbol)
+        if sig:
+            signals.append(sig)
 
     if not signals:
-        print("No valid signals this cycle.")
+        logger.info("No valid signals this cycle.")
         return
 
-    for signal in signals[: max(0, MAX_ACTIVE_TRADES - active_trade_count())]:
-        open_trade(signal)
+    # Open up to MAX_ACTIVE_TRADES
+    slots = MAX_ACTIVE_TRADES - active_trade_count()
+    for sig in signals[:slots]:
+        open_trade(sig)
 
+# -------------------- Reporting --------------------
+def send_heartbeat():
+    open_count = active_trade_count()
+    send_telegram(
+        f"💓 Bot Alive\n"
+        f"Open Trades: {open_count}\n"
+        f"Equity: {round(current_equity,2)}\n"
+        f"Time UTC: {now_utc().strftime('%Y-%m-%d %H:%M:%S')}"
+    )
 
 def send_performance():
     total = wins + losses
     winrate = (wins / total * 100) if total > 0 else 0
-    open_count = active_trade_count()
-
-    send(
-        f"PERFORMANCE\n\n"
+    send_telegram(
+        f"📊 PERFORMANCE\n\n"
         f"Wins: {wins}\n"
         f"Losses: {losses}\n"
-        f"Open Trades: {open_count}\n"
-        f"Win Rate: {round(winrate, 2)}%"
+        f"Win Rate: {round(winrate,2)}%\n"
+        f"Open Trades: {active_trade_count()}\n"
+        f"Current Equity: {round(current_equity,2)}"
     )
 
-
-def send_heartbeat():
-    send(
-        f"Bot is alive\n"
-        f"Open trades: {active_trade_count()}\n"
-        f"Time UTC: {now_utc().strftime('%Y-%m-%d %H:%M:%S')}"
-    )
-
-
+# -------------------- Main Loop --------------------
 def run_bot():
     setup_files()
-    require_telegram_config()
-    require_twelve_data_key()
-    print("Bot started... Sniper improved mode")
+    load_state()
+    logger.info("Bot started. Equity: %.2f, Wins: %d, Losses: %d", current_equity, wins, losses)
 
     last_scan = 0
     last_heartbeat = 0
@@ -628,7 +677,7 @@ def run_bot():
             now = time.time()
 
             if now - last_scan >= SCAN_INTERVAL_SECONDS:
-                print("Scanning market...")
+                logger.info("Scanning market...")
                 scan_market()
                 last_scan = now
 
@@ -638,20 +687,21 @@ def run_bot():
 
             if now - last_heartbeat >= HEARTBEAT_INTERVAL_SECONDS:
                 send_heartbeat()
-                print("Heartbeat sent")
                 last_heartbeat = now
 
             if now - last_report >= REPORT_INTERVAL_SECONDS:
                 send_performance()
-                print("Performance report sent")
                 last_report = now
 
-            print("Bot running...")
+        except Exception as e:
+            logger.exception("Unhandled error in main loop: %s", e)
+            send_telegram(f"⚠️ Bot error: {e}")
 
-        except Exception as exc:
-            print(f"Error: {exc}")
+        time.sleep(1)  # short sleep to yield CPU
 
-        time.sleep(10)
-
-
-run_bot()
+if __name__ == "__main__":
+    # Check essential environment variables
+    if not TWELVE_DATA_API_KEY:
+        logger.error("TWELVE_DATA_API_KEY missing.")
+        exit(1)
+    run_bot()
