@@ -1,3 +1,2 @@
-capitalcom
 pandas
 requests
