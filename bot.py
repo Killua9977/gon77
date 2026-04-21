@@ -3,19 +3,19 @@ import logging
 import math
 import os
 import time
+import json
 from datetime import datetime, timezone
 from typing import Dict, List, Optional
 
 import pandas as pd
 import requests
-from capitalcom import CapitalClient
 
 # -------------------- Configuration --------------------
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 CAPITAL_API_KEY = os.getenv("CAPITAL_API_KEY", "").strip()
 CAPITAL_LOGIN = os.getenv("CAPITAL_LOGIN", "").strip()
-CAPITAL_PASSWORD = os.getenv("CAPITAL_PASSWORD", "").strip()
+CAPITAL_PASSWORD = os.getenv("CAPITAL_PASSWORD", "").strip()  # This must be your API password!
 
 # Strategy Parameters
 INITIAL_EQUITY = float(os.getenv("INITIAL_EQUITY", "1000.0"))
@@ -63,70 +63,105 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# -------------------- Capital.com Broker Implementation --------------------
-class CapitalBroker:
-    """Capital.com trading and data broker using capitalcom package."""
+# -------------------- Capital.com Direct API Client --------------------
+class CapitalClient:
+    """Direct REST API client for Capital.com."""
     
-    def __init__(self, api_key: str, login: str, password: str):
+    def __init__(self, api_key: str, login: str, password: str, demo: bool = True):
         self.api_key = api_key
         self.login = login
         self.password = password
-        self.client = None
-        self.connect()
+        self.base_url = "https://demo-api-capital.backend-capital.com" if demo else "https://api-capital.backend-capital.com"
+        self.cst = None
+        self.security_token = None
+        self.session = requests.Session()
+        self.authenticate()
     
-    def connect(self):
-        """Establish connection to Capital.com demo environment."""
+    def authenticate(self):
+        """Create a session with Capital.com API."""
         try:
-            self.client = CapitalClient(
-                api_key=self.api_key,
-                login=self.login,
-                password=self.password,
-                demo=True
-            )
+            url = f"{self.base_url}/api/v1/session"
+            headers = {
+                "X-CAP-API-KEY": self.api_key,
+                "Content-Type": "application/json"
+            }
+            data = {
+                "identifier": self.login,
+                "password": self.password,
+                "encryptedPassword": False
+            }
+            
+            response = self.session.post(url, headers=headers, json=data, timeout=30)
+            
+            if response.status_code != 200:
+                error_msg = response.json().get('errorMessage', 'Unknown error')
+                raise Exception(f"Authentication failed: {error_msg}")
+            
+            self.cst = response.headers.get("CST")
+            self.security_token = response.headers.get("X-SECURITY-TOKEN")
+            
             logger.info("✅ Connected to Capital.com Demo Account")
+            return True
+            
         except Exception as e:
             logger.error(f"Failed to connect to Capital.com: {e}")
             raise
+    
+    def _make_request(self, method: str, endpoint: str, data: Dict = None) -> Optional[Dict]:
+        """Make authenticated request to Capital.com API."""
+        try:
+            url = f"{self.base_url}{endpoint}"
+            headers = {
+                "X-CAP-API-KEY": self.api_key,
+                "CST": self.cst,
+                "X-SECURITY-TOKEN": self.security_token,
+                "Content-Type": "application/json"
+            }
+            
+            if method == "GET":
+                response = self.session.get(url, headers=headers, timeout=30)
+            elif method == "POST":
+                response = self.session.post(url, headers=headers, json=data, timeout=30)
+            elif method == "DELETE":
+                response = self.session.delete(url, headers=headers, timeout=30)
+            else:
+                return None
+            
+            if response.status_code in [401, 403]:
+                # Session expired, re-authenticate
+                logger.info("Session expired, re-authenticating...")
+                self.authenticate()
+                return self._make_request(method, endpoint, data)
+            
+            if response.status_code != 200:
+                logger.error(f"API error: {response.status_code} - {response.text}")
+                return None
+            
+            return response.json()
+            
+        except Exception as e:
+            logger.error(f"Request failed: {e}")
+            return None
 
     # -------------------- Data Methods --------------------
-    def get_candles(self, epic: str, resolution: str = "MINUTE", num_candles: int = 300) -> Optional[pd.DataFrame]:
-        """
-        Fetch historical candles from Capital.com.
-        Resolution options: MINUTE, MINUTE_5, MINUTE_15, MINUTE_30, HOUR, HOUR_4, DAY
-        """
+    def get_candles(self, epic: str, resolution: str = "MINUTE_15", num_candles: int = 300) -> Optional[pd.DataFrame]:
+        """Fetch historical candles from Capital.com."""
         try:
-            # Map our resolution format to Capital.com format
-            resolution_map = {
-                "15min": "MINUTE_15",
-                "1h": "HOUR",
-                "5min": "MINUTE_5",
-                "1min": "MINUTE"
-            }
-            capital_resolution = resolution_map.get(resolution, "MINUTE_15")
-            
-            # Get historical prices
-            data = self.client.get_historical_prices(
-                epic=epic,
-                resolution=capital_resolution,
-                max=num_candles
-            )
+            endpoint = f"/api/v1/prices/{epic}?resolution={resolution}&max={num_candles}"
+            data = self._make_request("GET", endpoint)
             
             if not data or 'prices' not in data:
-                logger.warning(f"No candle data returned for {epic}")
                 return None
             
             rows = []
             for candle in data['prices']:
-                try:
-                    rows.append({
-                        "time": candle.get('snapshotTime'),
-                        "Open": float(candle.get('openPrice', {}).get('bid', 0)),
-                        "High": float(candle.get('highPrice', {}).get('bid', 0)),
-                        "Low": float(candle.get('lowPrice', {}).get('bid', 0)),
-                        "Close": float(candle.get('closePrice', {}).get('bid', 0)),
-                    })
-                except (KeyError, ValueError, TypeError):
-                    continue
+                rows.append({
+                    "time": candle['snapshotTime'],
+                    "Open": float(candle['openPrice']['bid']),
+                    "High": float(candle['highPrice']['bid']),
+                    "Low": float(candle['lowPrice']['bid']),
+                    "Close": float(candle['closePrice']['bid']),
+                })
             
             if not rows:
                 return None
@@ -143,20 +178,15 @@ class CapitalBroker:
     def get_live_price(self, epic: str) -> Optional[Dict]:
         """Get current bid/ask for a symbol."""
         try:
-            # Get market details for the epic
-            market_info = self.client.get_market_details(epic)
-            if not market_info:
+            endpoint = f"/api/v1/markets/{epic}"
+            data = self._make_request("GET", endpoint)
+            
+            if not data or 'snapshot' not in data:
                 return None
             
-            instrument = market_info.get('instrument', {})
-            snapshot = market_info.get('snapshot', {})
-            
-            bid = float(snapshot.get('bid', 0) or instrument.get('bid', 0))
-            ask = float(snapshot.get('offer', 0) or instrument.get('offer', 0))
-            
-            if bid <= 0 or ask <= 0:
-                return None
-                
+            snapshot = data['snapshot']
+            bid = float(snapshot['bid'])
+            ask = float(snapshot['offer'])
             mid = (bid + ask) / 2
             
             return {
@@ -177,33 +207,33 @@ class CapitalBroker:
         try:
             direction = "BUY" if order_type == "BUY" else "SELL"
             
-            # Calculate stop and limit distances in pips
+            # Calculate stop and limit distances
             pip_size = 0.0001
             if "JPY" in epic:
                 pip_size = 0.01
                 
             if direction == "BUY":
-                stop_distance = round(abs(entry - sl) / pip_size)
-                limit_distance = round(abs(tp - entry) / pip_size)
+                stop_distance = int(abs(entry - sl) / pip_size)
+                limit_distance = int(abs(tp - entry) / pip_size)
             else:
-                stop_distance = round(abs(sl - entry) / pip_size)
-                limit_distance = round(abs(entry - tp) / pip_size)
+                stop_distance = int(abs(sl - entry) / pip_size)
+                limit_distance = int(abs(entry - tp) / pip_size)
             
-            # Ensure minimum distances
-            stop_distance = max(stop_distance, 1)
-            limit_distance = max(limit_distance, 1)
+            endpoint = "/api/v1/positions"
+            data = {
+                "epic": epic,
+                "direction": direction,
+                "size": units,
+                "stopDistance": max(stop_distance, 1),
+                "limitDistance": max(limit_distance, 1),
+                "guaranteedStop": False,
+                "forceOpen": True
+            }
             
-            # Open position
-            result = self.client.open_position(
-                epic=epic,
-                direction=direction,
-                size=units,
-                stop_distance=stop_distance,
-                limit_distance=limit_distance
-            )
+            result = self._make_request("POST", endpoint, data)
             
             if result and 'dealReference' in result:
-                logger.info(f"Capital.com order placed: {order_type} {units} {epic}")
+                logger.info(f"Order placed: {order_type} {units} {epic}")
                 return result['dealReference']
             
             return None
@@ -212,33 +242,18 @@ class CapitalBroker:
             logger.error(f"Failed to place order for {epic}: {e}")
             return None
 
-    def close_position(self, deal_id: str) -> bool:
-        """Close a specific position."""
-        try:
-            result = self.client.close_position(deal_id)
-            return result is not None
-        except Exception as e:
-            logger.error(f"Failed to close position {deal_id}: {e}")
-            return False
-
     def get_account_balance(self) -> float:
-        """Get current account equity."""
+        """Get current account balance."""
         try:
-            accounts = self.client.get_accounts()
-            if accounts and len(accounts) > 0:
-                return float(accounts[0].get('balance', 0))
+            endpoint = "/api/v1/accounts"
+            data = self._make_request("GET", endpoint)
+            
+            if data and 'accounts' in data and len(data['accounts']) > 0:
+                return float(data['accounts'][0]['balance']['balance'])
             return 0.0
         except Exception as e:
             logger.error(f"Failed to get account balance: {e}")
             return 0.0
-    
-    def top_up_demo(self, amount: float = 5000):
-        """Add funds to demo account."""
-        try:
-            self.client.top_up_demo_account(amount=amount)
-            logger.info(f"Demo account topped up with ${amount}")
-        except Exception as e:
-            logger.error(f"Failed to top up demo: {e}")
 
 # -------------------- Helper Functions --------------------
 def ensure_csv(path: str, headers: List[str]):
@@ -374,9 +389,8 @@ def calculate_position_size(entry, sl):
 
 # -------------------- Signal Generation --------------------
 def build_signal(name: str, epic: str) -> Optional[Dict]:
-    # Get historical data from Capital.com
-    data_15m = broker.get_candles(epic, resolution="15min", num_candles=300)
-    data_1h = broker.get_candles(epic, resolution="1h", num_candles=300)
+    data_15m = broker.get_candles(epic, resolution="MINUTE_15", num_candles=300)
+    data_1h = broker.get_candles(epic, resolution="HOUR", num_candles=300)
     live = broker.get_live_price(epic)
 
     if data_15m is None or data_1h is None or live is None:
@@ -494,7 +508,6 @@ def update_trade_status(trade: Dict, live: Dict):
         if progress >= BREAK_EVEN_TRIGGER_R and not trade["break_even_done"]:
             trade["sl"] = max(trade["sl"], trade["entry"])
             trade["break_even_done"] = True
-            send_telegram(f"{trade['pair']} moved to break-even at {trade['sl']}")
         if trade["break_even_done"]:
             new_sl = price - trade["entry_atr"] * TRAILING_STOP_ATR_MULTIPLIER
             if new_sl > trade["sl"]:
@@ -510,7 +523,6 @@ def update_trade_status(trade: Dict, live: Dict):
         if progress >= BREAK_EVEN_TRIGGER_R and not trade["break_even_done"]:
             trade["sl"] = min(trade["sl"], trade["entry"])
             trade["break_even_done"] = True
-            send_telegram(f"{trade['pair']} moved to break-even at {trade['sl']}")
         if trade["break_even_done"]:
             new_sl = price + trade["entry_atr"] * TRAILING_STOP_ATR_MULTIPLIER
             if new_sl < trade["sl"]:
@@ -533,10 +545,8 @@ def check_trades():
 
 def scan_market():
     if not in_optimal_session():
-        logger.info("Market scan skipped: outside preferred session")
         return
     if active_trade_count() >= MAX_ACTIVE_TRADES:
-        logger.info("Market scan skipped: max active trades reached")
         return
     
     logger.info("Scanning market for signals...")
@@ -565,18 +575,14 @@ def run_bot():
     load_state()
 
     if not all([CAPITAL_API_KEY, CAPITAL_LOGIN, CAPITAL_PASSWORD]):
-        logger.error("Capital.com credentials not set! Please set CAPITAL_API_KEY, CAPITAL_LOGIN, and CAPITAL_PASSWORD")
+        logger.error("Missing Capital.com credentials!")
         return
 
-    broker = CapitalBroker(CAPITAL_API_KEY, CAPITAL_LOGIN, CAPITAL_PASSWORD)
+    broker = CapitalClient(CAPITAL_API_KEY, CAPITAL_LOGIN, CAPITAL_PASSWORD, demo=True)
     
-    # Top up demo account if balance is low
     balance = broker.get_account_balance()
-    if balance < 1000:
-        broker.top_up_demo(5000)
-    
-    logger.info(f"Bot started. Equity: ${broker.get_account_balance()}")
-    send_telegram(f"🚀 Capital.com Demo Bot Started\nEquity: ${round(broker.get_account_balance(),2)}")
+    logger.info(f"Bot started. Equity: ${balance}")
+    send_telegram(f"🚀 Capital.com Demo Bot Started\nEquity: ${round(balance,2)}")
 
     last_scan = last_heartbeat = last_report = last_check = 0
     while True:
@@ -595,8 +601,7 @@ def run_bot():
                 send_performance()
                 last_report = now
         except Exception as e:
-            logger.exception(f"Error in main loop: {e}")
-            send_telegram(f"⚠️ Bot error: {e}")
+            logger.exception(f"Error: {e}")
         time.sleep(1)
 
 if __name__ == "__main__":
