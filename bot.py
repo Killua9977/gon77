@@ -8,7 +8,7 @@ from typing import Dict, List, Optional
 
 import pandas as pd
 import requests
-from capitalcom_client import CapitalClient
+from capitalcom import CapitalClient
 
 # -------------------- Configuration --------------------
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
@@ -39,7 +39,6 @@ RESULTS_FILE = "trade_results.csv"
 LOG_FILE = "bot.log"
 
 # Capital.com EPIC codes for forex pairs
-# These map your internal pair names to Capital.com's instrument identifiers
 pairs = {
     "EURUSD": "CS.D.EURUSD.MINI.IP",
     "GBPUSD": "CS.D.GBPUSD.MINI.IP",
@@ -66,14 +65,13 @@ logger = logging.getLogger(__name__)
 
 # -------------------- Capital.com Broker Implementation --------------------
 class CapitalBroker:
-    """Capital.com trading and data broker using capitalcom_client."""
+    """Capital.com trading and data broker using capitalcom package."""
     
     def __init__(self, api_key: str, login: str, password: str):
         self.api_key = api_key
         self.login = login
         self.password = password
         self.client = None
-        self.account_id = None
         self.connect()
     
     def connect(self):
@@ -83,12 +81,8 @@ class CapitalBroker:
                 api_key=self.api_key,
                 login=self.login,
                 password=self.password,
-                demo=True  # Demo account
+                demo=True
             )
-            # Get account ID for later use
-            accounts = self.client.list_accounts()
-            if accounts and len(accounts) > 0:
-                self.account_id = accounts[0].get('accountId')
             logger.info("✅ Connected to Capital.com Demo Account")
         except Exception as e:
             logger.error(f"Failed to connect to Capital.com: {e}")
@@ -101,33 +95,38 @@ class CapitalBroker:
         Resolution options: MINUTE, MINUTE_5, MINUTE_15, MINUTE_30, HOUR, HOUR_4, DAY
         """
         try:
-            # Capital.com API requires specific resolution format
-            if resolution == "15min":
-                resolution = "MINUTE_15"
-            elif resolution == "1h":
-                resolution = "HOUR"
-            else:
-                resolution = "MINUTE_15"  # Default
+            # Map our resolution format to Capital.com format
+            resolution_map = {
+                "15min": "MINUTE_15",
+                "1h": "HOUR",
+                "5min": "MINUTE_5",
+                "1min": "MINUTE"
+            }
+            capital_resolution = resolution_map.get(resolution, "MINUTE_15")
             
             # Get historical prices
             data = self.client.get_historical_prices(
                 epic=epic,
-                resolution=resolution,
+                resolution=capital_resolution,
                 max=num_candles
             )
             
             if not data or 'prices' not in data:
+                logger.warning(f"No candle data returned for {epic}")
                 return None
             
             rows = []
             for candle in data['prices']:
-                rows.append({
-                    "time": candle.get('snapshotTime'),
-                    "Open": float(candle.get('openPrice', {}).get('bid', 0)),
-                    "High": float(candle.get('highPrice', {}).get('bid', 0)),
-                    "Low": float(candle.get('lowPrice', {}).get('bid', 0)),
-                    "Close": float(candle.get('closePrice', {}).get('bid', 0)),
-                })
+                try:
+                    rows.append({
+                        "time": candle.get('snapshotTime'),
+                        "Open": float(candle.get('openPrice', {}).get('bid', 0)),
+                        "High": float(candle.get('highPrice', {}).get('bid', 0)),
+                        "Low": float(candle.get('lowPrice', {}).get('bid', 0)),
+                        "Close": float(candle.get('closePrice', {}).get('bid', 0)),
+                    })
+                except (KeyError, ValueError, TypeError):
+                    continue
             
             if not rows:
                 return None
@@ -144,14 +143,20 @@ class CapitalBroker:
     def get_live_price(self, epic: str) -> Optional[Dict]:
         """Get current bid/ask for a symbol."""
         try:
-            # Search for instrument to get current pricing
-            instruments = self.client.search_instrument(epic)
-            if not instruments:
+            # Get market details for the epic
+            market_info = self.client.get_market_details(epic)
+            if not market_info:
                 return None
             
-            instrument = instruments[0] if isinstance(instruments, list) else instruments
-            bid = float(instrument.get('bid', 0))
-            ask = float(instrument.get('offer', 0))
+            instrument = market_info.get('instrument', {})
+            snapshot = market_info.get('snapshot', {})
+            
+            bid = float(snapshot.get('bid', 0) or instrument.get('bid', 0))
+            ask = float(snapshot.get('offer', 0) or instrument.get('offer', 0))
+            
+            if bid <= 0 or ask <= 0:
+                return None
+                
             mid = (bid + ask) / 2
             
             return {
@@ -170,13 +175,10 @@ class CapitalBroker:
                     entry: float, sl: float, tp: float) -> Optional[str]:
         """Place a market order with stop loss and take profit."""
         try:
-            # Capital.com size is in contracts (1.0 = 1 standard lot = 100,000 units)
-            size = units
-            
             direction = "BUY" if order_type == "BUY" else "SELL"
             
-            # Calculate stop and limit distances in pips for SL/TP
-            pip_size = 0.0001  # For most forex pairs
+            # Calculate stop and limit distances in pips
+            pip_size = 0.0001
             if "JPY" in epic:
                 pip_size = 0.01
                 
@@ -187,37 +189,53 @@ class CapitalBroker:
                 stop_distance = round(abs(sl - entry) / pip_size)
                 limit_distance = round(abs(entry - tp) / pip_size)
             
+            # Ensure minimum distances
+            stop_distance = max(stop_distance, 1)
+            limit_distance = max(limit_distance, 1)
+            
             # Open position
-            result = self.client.open_forex_position(
+            result = self.client.open_position(
                 epic=epic,
-                size=size,
                 direction=direction,
-                stop_dist=stop_distance,
-                profit_dist=limit_distance
+                size=units,
+                stop_distance=stop_distance,
+                limit_distance=limit_distance
             )
             
             if result and 'dealReference' in result:
-                logger.info(f"Capital.com order placed: {order_type} {size} {epic}")
+                logger.info(f"Capital.com order placed: {order_type} {units} {epic}")
                 return result['dealReference']
+            
             return None
             
         except Exception as e:
             logger.error(f"Failed to place order for {epic}: {e}")
             return None
 
+    def close_position(self, deal_id: str) -> bool:
+        """Close a specific position."""
+        try:
+            result = self.client.close_position(deal_id)
+            return result is not None
+        except Exception as e:
+            logger.error(f"Failed to close position {deal_id}: {e}")
+            return False
+
     def get_account_balance(self) -> float:
         """Get current account equity."""
         try:
-            balance = self.client.get_balance()
-            return float(balance) if balance else 0.0
+            accounts = self.client.get_accounts()
+            if accounts and len(accounts) > 0:
+                return float(accounts[0].get('balance', 0))
+            return 0.0
         except Exception as e:
             logger.error(f"Failed to get account balance: {e}")
             return 0.0
     
     def top_up_demo(self, amount: float = 5000):
-        """Add funds to demo account (up to 100K)."""
+        """Add funds to demo account."""
         try:
-            self.client.top_up_demo(amount)
+            self.client.top_up_demo_account(amount=amount)
             logger.info(f"Demo account topped up with ${amount}")
         except Exception as e:
             logger.error(f"Failed to top up demo: {e}")
@@ -476,6 +494,7 @@ def update_trade_status(trade: Dict, live: Dict):
         if progress >= BREAK_EVEN_TRIGGER_R and not trade["break_even_done"]:
             trade["sl"] = max(trade["sl"], trade["entry"])
             trade["break_even_done"] = True
+            send_telegram(f"{trade['pair']} moved to break-even at {trade['sl']}")
         if trade["break_even_done"]:
             new_sl = price - trade["entry_atr"] * TRAILING_STOP_ATR_MULTIPLIER
             if new_sl > trade["sl"]:
@@ -491,6 +510,7 @@ def update_trade_status(trade: Dict, live: Dict):
         if progress >= BREAK_EVEN_TRIGGER_R and not trade["break_even_done"]:
             trade["sl"] = min(trade["sl"], trade["entry"])
             trade["break_even_done"] = True
+            send_telegram(f"{trade['pair']} moved to break-even at {trade['sl']}")
         if trade["break_even_done"]:
             new_sl = price + trade["entry_atr"] * TRAILING_STOP_ATR_MULTIPLIER
             if new_sl < trade["sl"]:
@@ -513,9 +533,13 @@ def check_trades():
 
 def scan_market():
     if not in_optimal_session():
+        logger.info("Market scan skipped: outside preferred session")
         return
     if active_trade_count() >= MAX_ACTIVE_TRADES:
+        logger.info("Market scan skipped: max active trades reached")
         return
+    
+    logger.info("Scanning market for signals...")
     for name, epic in pairs.items():
         if has_open_trade(name) or not cooldown_ready(name):
             continue
@@ -527,7 +551,7 @@ def scan_market():
 
 def send_heartbeat():
     eq = broker.get_account_balance() if broker else 0
-    send_telegram(f"💓 Alive | Trades: {active_trade_count()} | Equity: {round(eq,2)}")
+    send_telegram(f"💓 Alive | Trades: {active_trade_count()} | Equity: ${round(eq,2)}")
 
 def send_performance():
     total = wins + losses
@@ -551,8 +575,8 @@ def run_bot():
     if balance < 1000:
         broker.top_up_demo(5000)
     
-    logger.info(f"Bot started. Equity: {broker.get_account_balance()}")
-    send_telegram("🚀 Capital.com Demo Bot Started")
+    logger.info(f"Bot started. Equity: ${broker.get_account_balance()}")
+    send_telegram(f"🚀 Capital.com Demo Bot Started\nEquity: ${round(broker.get_account_balance(),2)}")
 
     last_scan = last_heartbeat = last_report = last_check = 0
     while True:
@@ -571,7 +595,8 @@ def run_bot():
                 send_performance()
                 last_report = now
         except Exception as e:
-            logger.exception(f"Error: {e}")
+            logger.exception(f"Error in main loop: {e}")
+            send_telegram(f"⚠️ Bot error: {e}")
         time.sleep(1)
 
 if __name__ == "__main__":
