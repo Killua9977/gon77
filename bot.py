@@ -4,16 +4,18 @@ import math
 import os
 import time
 from datetime import datetime, timezone
-from typing import Dict, List, Optional, Any
+from typing import Dict, List, Optional
 
 import pandas as pd
 import requests
+from capitalcom_client import CapitalClient
 
 # -------------------- Configuration --------------------
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
-TWELVE_DATA_API_KEY = os.getenv("TWELVE_DATA_API_KEY", "").strip()
-TWELVE_DATA_BASE_URL = "https://api.twelvedata.com"
+CAPITAL_API_KEY = os.getenv("CAPITAL_API_KEY", "").strip()
+CAPITAL_LOGIN = os.getenv("CAPITAL_LOGIN", "").strip()
+CAPITAL_PASSWORD = os.getenv("CAPITAL_PASSWORD", "").strip()
 
 # Strategy Parameters
 INITIAL_EQUITY = float(os.getenv("INITIAL_EQUITY", "1000.0"))
@@ -36,17 +38,19 @@ STATE_FILE = "trade_state.csv"
 RESULTS_FILE = "trade_results.csv"
 LOG_FILE = "bot.log"
 
+# Capital.com EPIC codes for forex pairs
+# These map your internal pair names to Capital.com's instrument identifiers
 pairs = {
-    "EURUSD": "EUR/USD",
-    "GBPUSD": "GBP/USD",
-    "USDJPY": "USD/JPY",
-    "USDCHF": "USD/CHF",
-    "AUDUSD": "AUD/USD",
-    "USDCAD": "USD/CAD",
-    "NZDUSD": "NZD/USD",
-    "EURGBP": "EUR/GBP",
-    "EURJPY": "EUR/JPY",
-    "GBPJPY": "GBP/JPY",
+    "EURUSD": "CS.D.EURUSD.MINI.IP",
+    "GBPUSD": "CS.D.GBPUSD.MINI.IP",
+    "USDJPY": "CS.D.USDJPY.MINI.IP",
+    "USDCHF": "CS.D.USDCHF.MINI.IP",
+    "AUDUSD": "CS.D.AUDUSD.MINI.IP",
+    "USDCAD": "CS.D.USDCAD.MINI.IP",
+    "NZDUSD": "CS.D.NZDUSD.MINI.IP",
+    "EURGBP": "CS.D.EURGBP.MINI.IP",
+    "EURJPY": "CS.D.EURJPY.MINI.IP",
+    "GBPJPY": "CS.D.GBPJPY.MINI.IP",
 }
 
 # -------------------- Logging Setup --------------------
@@ -60,187 +64,191 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# -------------------- Manual Retry Logic --------------------
-def retry_on_failure(max_attempts=3, initial_wait=2, max_wait=10):
-    """Simple retry decorator."""
-    def decorator(func):
-        def wrapper(*args, **kwargs):
-            wait_time = initial_wait
-            for attempt in range(max_attempts):
-                try:
-                    return func(*args, **kwargs)
-                except (requests.RequestException, RuntimeError) as e:
-                    if attempt == max_attempts - 1:
-                        raise
-                    logger.warning(f"Attempt {attempt + 1} failed: {e}. Retrying in {wait_time}s...")
-                    time.sleep(wait_time)
-                    wait_time = min(wait_time * 2, max_wait)
+# -------------------- Capital.com Broker Implementation --------------------
+class CapitalBroker:
+    """Capital.com trading and data broker using capitalcom_client."""
+    
+    def __init__(self, api_key: str, login: str, password: str):
+        self.api_key = api_key
+        self.login = login
+        self.password = password
+        self.client = None
+        self.account_id = None
+        self.connect()
+    
+    def connect(self):
+        """Establish connection to Capital.com demo environment."""
+        try:
+            self.client = CapitalClient(
+                api_key=self.api_key,
+                login=self.login,
+                password=self.password,
+                demo=True  # Demo account
+            )
+            # Get account ID for later use
+            accounts = self.client.list_accounts()
+            if accounts and len(accounts) > 0:
+                self.account_id = accounts[0].get('accountId')
+            logger.info("✅ Connected to Capital.com Demo Account")
+        except Exception as e:
+            logger.error(f"Failed to connect to Capital.com: {e}")
+            raise
+
+    # -------------------- Data Methods --------------------
+    def get_candles(self, epic: str, resolution: str = "MINUTE", num_candles: int = 300) -> Optional[pd.DataFrame]:
+        """
+        Fetch historical candles from Capital.com.
+        Resolution options: MINUTE, MINUTE_5, MINUTE_15, MINUTE_30, HOUR, HOUR_4, DAY
+        """
+        try:
+            # Capital.com API requires specific resolution format
+            if resolution == "15min":
+                resolution = "MINUTE_15"
+            elif resolution == "1h":
+                resolution = "HOUR"
+            else:
+                resolution = "MINUTE_15"  # Default
+            
+            # Get historical prices
+            data = self.client.get_historical_prices(
+                epic=epic,
+                resolution=resolution,
+                max=num_candles
+            )
+            
+            if not data or 'prices' not in data:
+                return None
+            
+            rows = []
+            for candle in data['prices']:
+                rows.append({
+                    "time": candle.get('snapshotTime'),
+                    "Open": float(candle.get('openPrice', {}).get('bid', 0)),
+                    "High": float(candle.get('highPrice', {}).get('bid', 0)),
+                    "Low": float(candle.get('lowPrice', {}).get('bid', 0)),
+                    "Close": float(candle.get('closePrice', {}).get('bid', 0)),
+                })
+            
+            if not rows:
+                return None
+                
+            df = pd.DataFrame(rows)
+            df["time"] = pd.to_datetime(df["time"])
+            df.set_index("time", inplace=True)
+            return df.dropna()
+            
+        except Exception as e:
+            logger.error(f"Failed to get candles for {epic}: {e}")
             return None
-        return wrapper
-    return decorator
 
-# -------------------- Rate Limiter --------------------
-class RateLimiter:
-    def __init__(self, max_calls: int = 8, period: float = 60.0):
-        self.max_calls = max_calls
-        self.period = period
-        self.tokens = max_calls
-        self.last_refill = time.monotonic()
+    def get_live_price(self, epic: str) -> Optional[Dict]:
+        """Get current bid/ask for a symbol."""
+        try:
+            # Search for instrument to get current pricing
+            instruments = self.client.search_instrument(epic)
+            if not instruments:
+                return None
+            
+            instrument = instruments[0] if isinstance(instruments, list) else instruments
+            bid = float(instrument.get('bid', 0))
+            ask = float(instrument.get('offer', 0))
+            mid = (bid + ask) / 2
+            
+            return {
+                "bid": bid,
+                "ask": ask,
+                "mid": mid,
+                "spread": round(ask - bid, 5),
+                "tradeable": True,
+            }
+        except Exception as e:
+            logger.error(f"Failed to get live price for {epic}: {e}")
+            return None
 
-    def _refill(self):
-        now = time.monotonic()
-        elapsed = now - self.last_refill
-        new_tokens = elapsed * (self.max_calls / self.period)
-        self.tokens = min(self.max_calls, self.tokens + new_tokens)
-        self.last_refill = now
+    # -------------------- Trading Methods --------------------
+    def place_order(self, epic: str, order_type: str, units: float,
+                    entry: float, sl: float, tp: float) -> Optional[str]:
+        """Place a market order with stop loss and take profit."""
+        try:
+            # Capital.com size is in contracts (1.0 = 1 standard lot = 100,000 units)
+            size = units
+            
+            direction = "BUY" if order_type == "BUY" else "SELL"
+            
+            # Calculate stop and limit distances in pips for SL/TP
+            pip_size = 0.0001  # For most forex pairs
+            if "JPY" in epic:
+                pip_size = 0.01
+                
+            if direction == "BUY":
+                stop_distance = round(abs(entry - sl) / pip_size)
+                limit_distance = round(abs(tp - entry) / pip_size)
+            else:
+                stop_distance = round(abs(sl - entry) / pip_size)
+                limit_distance = round(abs(entry - tp) / pip_size)
+            
+            # Open position
+            result = self.client.open_forex_position(
+                epic=epic,
+                size=size,
+                direction=direction,
+                stop_dist=stop_distance,
+                profit_dist=limit_distance
+            )
+            
+            if result and 'dealReference' in result:
+                logger.info(f"Capital.com order placed: {order_type} {size} {epic}")
+                return result['dealReference']
+            return None
+            
+        except Exception as e:
+            logger.error(f"Failed to place order for {epic}: {e}")
+            return None
 
-    def acquire(self):
-        while True:
-            self._refill()
-            if self.tokens >= 1:
-                self.tokens -= 1
-                return
-            time.sleep(0.1)
-
-_rate_limiter = RateLimiter()
-
-def rate_limited_request(method: str, url: str, **kwargs) -> requests.Response:
-    _rate_limiter.acquire()
-    response = requests.request(method, url, **kwargs)
-    response.raise_for_status()
-    return response
+    def get_account_balance(self) -> float:
+        """Get current account equity."""
+        try:
+            balance = self.client.get_balance()
+            return float(balance) if balance else 0.0
+        except Exception as e:
+            logger.error(f"Failed to get account balance: {e}")
+            return 0.0
+    
+    def top_up_demo(self, amount: float = 5000):
+        """Add funds to demo account (up to 100K)."""
+        try:
+            self.client.top_up_demo(amount)
+            logger.info(f"Demo account topped up with ${amount}")
+        except Exception as e:
+            logger.error(f"Failed to top up demo: {e}")
 
 # -------------------- Helper Functions --------------------
 def ensure_csv(path: str, headers: List[str]):
     if not os.path.exists(path):
-        with open(path, mode="w", newline="", encoding="utf-8") as f:
-            writer = csv.writer(f)
-            writer.writerow(headers)
+        with open(path, 'w', newline='', encoding='utf-8') as f:
+            csv.writer(f).writerow(headers)
 
 def setup_files():
-    ensure_csv(RESULTS_FILE, [
-        "timestamp", "pair", "type", "entry", "sl", "tp",
-        "exit_price", "status", "profit_r", "pnl", "equity_after"
-    ])
-    ensure_csv(STATE_FILE, [
-        "pair", "type", "entry", "sl", "tp", "status", "opened_at",
-        "risk_per_unit", "break_even_done", "symbol", "entry_atr", "lot_size"
-    ])
+    ensure_csv(RESULTS_FILE, ["timestamp","pair","type","entry","sl","tp","exit_price","status","profit_r","pnl"])
+    ensure_csv(STATE_FILE, ["pair","type","entry","sl","tp","status","opened_at","risk_per_unit","break_even_done","epic","entry_atr","lot_size","deal_ref"])
 
-def is_valid_number(value):
-    return value is not None and not math.isnan(value) and math.isfinite(value)
+def is_valid_number(v):
+    return v is not None and not math.isnan(v) and math.isfinite(v)
 
 def now_utc():
     return datetime.now(timezone.utc)
 
-def send_telegram(message: str):
+def send_telegram(msg: str):
     if not TOKEN or not CHAT_ID:
-        logger.warning("Telegram not configured; message not sent: %s", message)
         return
-    url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
     try:
-        resp = requests.post(url, data={"chat_id": CHAT_ID, "text": message}, timeout=10)
-        resp.raise_for_status()
+        requests.post(f"https://api.telegram.org/bot{TOKEN}/sendMessage",
+                     data={"chat_id": CHAT_ID, "text": msg}, timeout=10)
     except Exception as e:
-        logger.error("Telegram send failed: %s", e)
-
-# -------------------- Broker Abstraction --------------------
-class Broker:
-    def place_order(self, symbol: str, order_type: str, units: float,
-                    entry: float, sl: float, tp: float) -> Optional[str]:
-        raise NotImplementedError
-
-class SimulationBroker(Broker):
-    def place_order(self, symbol: str, order_type: str, units: float,
-                    entry: float, sl: float, tp: float) -> Optional[str]:
-        logger.info("SIMULATION: Placed %s order for %s units of %s at %s", 
-                   order_type, units, symbol, entry)
-        return "SIM-" + str(int(time.time()))
-
-broker = SimulationBroker()
-
-# -------------------- Twelve Data API --------------------
-@retry_on_failure(max_attempts=3, initial_wait=2, max_wait=10)
-def twelve_data_get(path: str, params: Optional[Dict] = None) -> Dict:
-    if not TWELVE_DATA_API_KEY:
-        raise RuntimeError("Missing TWELVE_DATA_API_KEY")
-    query = dict(params or {})
-    query["apikey"] = TWELVE_DATA_API_KEY
-    response = rate_limited_request("GET", f"{TWELVE_DATA_BASE_URL}{path}", params=query, timeout=15)
-    payload = response.json()
-    if payload.get("status") == "error":
-        raise RuntimeError(payload.get("message", "Twelve Data error"))
-    return payload
-
-def get_history(symbol: str, period: str, interval: str) -> Optional[pd.DataFrame]:
-    """Fetch historical candles and return as DataFrame."""
-    try:
-        # Fixed: Use proper Twelve Data interval format
-        outputsize_map = {"15min": 300, "1h": 300, "5min": 300}
-        payload = twelve_data_get("/time_series", {
-            "symbol": symbol,
-            "interval": interval,
-            "outputsize": outputsize_map.get(interval, 300),
-            "timezone": "UTC",
-            "format": "JSON",
-        })
-    except Exception as e:
-        logger.error("History fetch failed for %s: %s", symbol, e)
-        return None
-
-    values = payload.get("values", [])
-    if not values:
-        logger.warning(f"No historical data returned for {symbol}")
-        return None
-        
-    rows = []
-    for candle in reversed(values):
-        try:
-            rows.append({
-                "time": candle["datetime"],
-                "Open": float(candle["open"]),
-                "High": float(candle["high"]),
-                "Low": float(candle["low"]),
-                "Close": float(candle["close"]),
-                "Volume": float(candle.get("volume", 0) or 0),
-            })
-        except (KeyError, ValueError) as e:
-            logger.warning(f"Skipping malformed candle for {symbol}: {e}")
-            continue
-            
-    if not rows:
-        return None
-    df = pd.DataFrame(rows)
-    df["time"] = pd.to_datetime(df["time"], utc=True)
-    df.set_index("time", inplace=True)
-    return df.dropna()
-
-def get_live_price(symbol: str) -> Optional[Dict]:
-    try:
-        payload = twelve_data_get("/quote", {"symbol": symbol, "interval": "1min"})
-    except Exception as e:
-        logger.error("Pricing fetch failed for %s: %s", symbol, e)
-        return None
-
-    close = payload.get("close")
-    if close is None:
-        return None
-    mid = float(close)
-    ask = float(payload.get("ask", mid))
-    bid = float(payload.get("bid", mid))
-    if ask < bid:
-        ask = mid
-        bid = mid
-    return {
-        "bid": bid,
-        "ask": ask,
-        "mid": mid,
-        "spread": round(max(ask - bid, 0.0), 5),
-        "tradeable": True,
-    }
+        logger.error(f"Telegram error: {e}")
 
 # -------------------- Technical Indicators --------------------
-def calculate_rsi(series: pd.Series, period: int = 14) -> pd.Series:
+def calculate_rsi(series, period=14):
     delta = series.diff()
     gain = delta.clip(lower=0).ewm(alpha=1/period, adjust=False).mean()
     loss = (-delta.clip(upper=0)).ewm(alpha=1/period, adjust=False).mean()
@@ -248,43 +256,35 @@ def calculate_rsi(series: pd.Series, period: int = 14) -> pd.Series:
     rs = gain / loss
     return 100 - (100 / (1 + rs))
 
-def calculate_atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
-    high = df["High"]
-    low = df["Low"]
-    close = df["Close"]
+def calculate_atr(df, period=14):
+    high, low, close = df["High"], df["Low"], df["Close"]
     prev_close = close.shift(1)
-    tr = (high - low).combine((high - prev_close).abs(), max)
-    tr = tr.combine((low - prev_close).abs(), max)
+    tr = (high - low).combine((high - prev_close).abs(), max).combine((low - prev_close).abs(), max)
     return tr.ewm(alpha=1/period, adjust=False).mean()
 
 # -------------------- Session Filter --------------------
-def in_optimal_session() -> bool:
+def in_optimal_session():
     now = now_utc()
-    if now.weekday() >= 5:
-        return False
-    return 12 <= now.hour < 16
+    return now.weekday() < 5 and 12 <= now.hour < 16
 
 # -------------------- Global State --------------------
 trades: List[Dict] = []
-current_equity = INITIAL_EQUITY
-wins = 0
-losses = 0
+wins = losses = 0
 last_trade_times: Dict[str, float] = {}
+broker = None
 
 # -------------------- State Persistence --------------------
 def load_state():
-    global trades, last_trade_times, current_equity, wins, losses
+    global trades, last_trade_times, wins, losses
     if not os.path.exists(STATE_FILE):
         return
-
-    with open(STATE_FILE, mode="r", encoding="utf-8") as f:
-        reader = csv.DictReader(f)
-        for row in reader:
+    with open(STATE_FILE, 'r') as f:
+        for row in csv.DictReader(f):
             if row["status"] != "OPEN":
                 continue
-            trade = {
+            trades.append({
                 "pair": row["pair"],
-                "symbol": row["symbol"],
+                "epic": row["epic"],
                 "type": row["type"],
                 "entry": float(row["entry"]),
                 "sl": float(row["sl"]),
@@ -293,112 +293,77 @@ def load_state():
                 "opened_at": float(row["opened_at"]),
                 "risk_per_unit": float(row["risk_per_unit"]),
                 "break_even_done": row["break_even_done"] == "1",
-                "entry_atr": float(row.get("entry_atr", 0.0)),
-                "lot_size": float(row.get("lot_size", 0.0)),
-                "broker_order_id": row.get("broker_order_id", None),
-            }
-            trades.append(trade)
-            last_trade_times[trade["pair"]] = trade["opened_at"]
-
+                "entry_atr": float(row.get("entry_atr", 0)),
+                "lot_size": float(row.get("lot_size", 0)),
+                "deal_ref": row.get("deal_ref", "")
+            })
+            last_trade_times[row["pair"]] = float(row["opened_at"])
     if os.path.exists(RESULTS_FILE):
-        with open(RESULTS_FILE, mode="r", encoding="utf-8") as f:
-            reader = csv.DictReader(f)
-            for row in reader:
+        with open(RESULTS_FILE, 'r') as f:
+            for row in csv.DictReader(f):
                 if row["status"] == "WIN":
                     wins += 1
                 elif row["status"] == "LOSS":
                     losses += 1
-                equity_str = row.get("equity_after")
-                if equity_str:
-                    current_equity = float(equity_str)
-
-    logger.info("Loaded %d open trades. Equity: %.2f, Wins: %d, Losses: %d",
-                len([t for t in trades if t["status"] == "OPEN"]), current_equity, wins, losses)
 
 def save_open_state():
-    with open(STATE_FILE, mode="w", newline="", encoding="utf-8") as f:
-        writer = csv.writer(f)
-        writer.writerow([
-            "pair", "type", "entry", "sl", "tp", "status", "opened_at",
-            "risk_per_unit", "break_even_done", "symbol", "entry_atr", "lot_size", "broker_order_id"
-        ])
+    with open(STATE_FILE, 'w', newline='') as f:
+        w = csv.writer(f)
+        w.writerow(["pair","type","entry","sl","tp","status","opened_at","risk_per_unit","break_even_done","epic","entry_atr","lot_size","deal_ref"])
         for t in trades:
             if t["status"] == "OPEN":
-                writer.writerow([
-                    t["pair"], t["type"], t["entry"], t["sl"], t["tp"],
-                    t["status"], t["opened_at"], t["risk_per_unit"],
-                    int(t["break_even_done"]), t["symbol"], t["entry_atr"],
-                    t["lot_size"], t.get("broker_order_id", "")
-                ])
+                w.writerow([t["pair"], t["type"], t["entry"], t["sl"], t["tp"], t["status"],
+                           t["opened_at"], t["risk_per_unit"], int(t["break_even_done"]),
+                           t["epic"], t["entry_atr"], t["lot_size"], t.get("deal_ref","")])
 
-def save_trade_result(trade: Dict, status: str, exit_price: float):
-    global current_equity, wins, losses
-
+def save_trade_result(trade, status, exit_price):
+    global wins, losses
     risk = trade["risk_per_unit"]
-    lot_size = trade["lot_size"]
     if trade["type"] == "BUY":
-        profit = (exit_price - trade["entry"]) * lot_size
-        profit_r = (exit_price - trade["entry"]) / risk if risk > 0 else 0.0
+        profit = (exit_price - trade["entry"]) * trade["lot_size"]
+        profit_r = (exit_price - trade["entry"]) / risk if risk else 0
     else:
-        profit = (trade["entry"] - exit_price) * lot_size
-        profit_r = (trade["entry"] - exit_price) / risk if risk > 0 else 0.0
-
-    current_equity += profit
-
-    with open(RESULTS_FILE, mode="a", newline="", encoding="utf-8") as f:
-        writer = csv.writer(f)
-        writer.writerow([
-            now_utc().isoformat(),
-            trade["pair"],
-            trade["type"],
-            round(trade["entry"], 5),
-            round(trade["sl"], 5),
-            round(trade["tp"], 5),
-            round(exit_price, 5),
-            status,
-            round(profit_r, 2),
-            round(profit, 2),
-            round(current_equity, 2)
-        ])
-
+        profit = (trade["entry"] - exit_price) * trade["lot_size"]
+        profit_r = (trade["entry"] - exit_price) / risk if risk else 0
+    with open(RESULTS_FILE, 'a', newline='') as f:
+        csv.writer(f).writerow([now_utc().isoformat(), trade["pair"], trade["type"],
+            round(trade["entry"],5), round(trade["sl"],5), round(trade["tp"],5),
+            round(exit_price,5), status, round(profit_r,2), round(profit,2)])
     if status == "WIN":
         wins += 1
     else:
         losses += 1
-
-    send_telegram(f"{status} {trade['pair']} at {round(exit_price,5)} | PnL: {round(profit,2)} | Equity: {round(current_equity,2)}")
+    send_telegram(f"{status} {trade['pair']} @ {round(exit_price,5)} | PnL: {round(profit,2)}")
 
 # -------------------- Trade Management --------------------
-def has_open_trade(pair: str) -> bool:
-    return any(t["pair"] == pair and t["status"] == "OPEN" for t in trades)
-
-def active_trade_count() -> int:
+def active_trade_count():
     return sum(1 for t in trades if t["status"] == "OPEN")
 
-def cooldown_ready(pair: str) -> bool:
-    last_time = last_trade_times.get(pair)
-    if last_time is None:
-        return True
-    return (time.time() - last_time) >= PAIR_COOLDOWN_SECONDS
+def has_open_trade(pair):
+    return any(t["pair"] == pair and t["status"] == "OPEN" for t in trades)
 
-def calculate_position_size(entry: float, sl: float) -> float:
-    risk_amount = current_equity * (RISK_PERCENT / 100.0)
-    sl_distance = abs(entry - sl)
-    if sl_distance <= 0:
-        return 0.0
-    return round(risk_amount / sl_distance, 2)
+def cooldown_ready(pair):
+    last = last_trade_times.get(pair)
+    return last is None or (time.time() - last) >= PAIR_COOLDOWN_SECONDS
+
+def calculate_position_size(entry, sl):
+    equity = broker.get_account_balance() if broker else INITIAL_EQUITY
+    if equity <= 0:
+        equity = INITIAL_EQUITY
+    risk_amt = equity * (RISK_PERCENT / 100)
+    sl_dist = abs(entry - sl)
+    return round(risk_amt / sl_dist, 2) if sl_dist > 0 else 0
 
 # -------------------- Signal Generation --------------------
-def build_signal(name: str, symbol: str) -> Optional[Dict]:
-    # Fixed: Use proper Twelve Data interval format "15min" instead of "15m"
-    data_15m = get_history(symbol, period="10d", interval="15min")
-    data_1h = get_history(symbol, period="20d", interval="1h")
-    live = get_live_price(symbol)
+def build_signal(name: str, epic: str) -> Optional[Dict]:
+    # Get historical data from Capital.com
+    data_15m = broker.get_candles(epic, resolution="15min", num_candles=300)
+    data_1h = broker.get_candles(epic, resolution="1h", num_candles=300)
+    live = broker.get_live_price(epic)
 
     if data_15m is None or data_1h is None or live is None:
         return None
     if len(data_15m) < 80 or len(data_1h) < 80:
-        logger.info(f"Insufficient data for {symbol}: 15min={len(data_15m) if data_15m is not None else 0}, 1h={len(data_1h) if data_1h is not None else 0}")
         return None
 
     close_15m = data_15m["Close"]
@@ -408,106 +373,78 @@ def build_signal(name: str, symbol: str) -> Optional[Dict]:
     ema50_15m = close_15m.ewm(span=50, adjust=False).mean()
     ema20_1h = close_1h.ewm(span=20, adjust=False).mean()
     ema50_1h = close_1h.ewm(span=50, adjust=False).mean()
-    rsi_15m = calculate_rsi(close_15m)
-    atr_15m = calculate_atr(data_15m)
+    rsi = calculate_rsi(close_15m)
+    atr = calculate_atr(data_15m)
 
-    latest_price = float(close_15m.iloc[-1])
-    prev_price = float(close_15m.iloc[-2])
-    latest_ema20_15m = float(ema20_15m.iloc[-1])
-    prev_ema20_15m = float(ema20_15m.iloc[-2])
-    latest_ema50_15m = float(ema50_15m.iloc[-1])
-    latest_ema20_1h = float(ema20_1h.iloc[-1])
-    latest_ema50_1h = float(ema50_1h.iloc[-1])
-    latest_rsi = float(rsi_15m.iloc[-1])
-    latest_atr = float(atr_15m.iloc[-1])
-    candle_high = float(data_15m["High"].iloc[-1])
-    candle_low = float(data_15m["Low"].iloc[-1])
-    previous_high = float(data_15m["High"].iloc[-2])
-    previous_low = float(data_15m["Low"].iloc[-2])
+    lp = float(close_15m.iloc[-1])
+    prev_p = float(close_15m.iloc[-2])
+    e20_15 = float(ema20_15m.iloc[-1])
+    prev_e20 = float(ema20_15m.iloc[-2])
+    e50_15 = float(ema50_15m.iloc[-1])
+    e20_1h = float(ema20_1h.iloc[-1])
+    e50_1h = float(ema50_1h.iloc[-1])
+    rsi_val = float(rsi.iloc[-1])
+    atr_val = float(atr.iloc[-1])
+    high = float(data_15m["High"].iloc[-1])
+    low = float(data_15m["Low"].iloc[-1])
+    prev_high = float(data_15m["High"].iloc[-2])
+    prev_low = float(data_15m["Low"].iloc[-2])
 
-    values = [latest_price, prev_price, latest_ema20_15m, prev_ema20_15m, latest_ema50_15m,
-              latest_ema20_1h, latest_ema50_1h, latest_rsi, latest_atr,
-              candle_high, candle_low, previous_high, previous_low]
-    if not all(is_valid_number(v) for v in values):
+    if not all(is_valid_number(v) for v in [lp, prev_p, e20_15, prev_e20, e50_15, e20_1h, e50_1h, rsi_val, atr_val]):
         return None
-    if latest_atr <= 0:
+    if atr_val <= 0:
         return None
-    if not live["tradeable"]:
+    if live["spread"] > atr_val * MAX_SPREAD_TO_ATR_RATIO:
         return None
-    if live["spread"] > latest_atr * MAX_SPREAD_TO_ATR_RATIO:
-        logger.info(f"{symbol} spread too high: {live['spread']} > {latest_atr * MAX_SPREAD_TO_ATR_RATIO}")
+    if abs(e20_15 - e50_15) < atr_val * 0.25:
         return None
 
-    trend_gap = abs(latest_ema20_15m - latest_ema50_15m)
-    if trend_gap < latest_atr * 0.25:
+    sig = None
+    if (lp > e20_15 > e50_15 and float(close_1h.iloc[-1]) > e20_1h > e50_1h and
+        52 <= rsi_val <= 68 and prev_p <= prev_e20 * 1.0015 and high > prev_high):
+        sig = "BUY"
+    elif (lp < e20_15 < e50_15 and float(close_1h.iloc[-1]) < e20_1h < e50_1h and
+          32 <= rsi_val <= 48 and prev_p >= prev_e20 * 0.9985 and low < prev_low):
+        sig = "SELL"
+
+    if not sig:
         return None
 
-    signal_type = None
-
-    if (latest_price > latest_ema20_15m > latest_ema50_15m and
-        float(close_1h.iloc[-1]) > latest_ema20_1h > latest_ema50_1h and
-        52 <= latest_rsi <= 68 and
-        prev_price <= prev_ema20_15m * 1.0015 and
-        candle_high > previous_high):
-        signal_type = "BUY"
-    elif (latest_price < latest_ema20_15m < latest_ema50_15m and
-          float(close_1h.iloc[-1]) < latest_ema20_1h < latest_ema50_1h and
-          32 <= latest_rsi <= 48 and
-          prev_price >= prev_ema20_15m * 0.9985 and
-          candle_low < previous_low):
-        signal_type = "SELL"
-
-    if signal_type is None:
-        return None
-
-    entry = round(live["ask"] if signal_type == "BUY" else live["bid"], 5)
-    stop_distance = round(latest_atr * ATR_STOP_MULTIPLIER, 5)
-    target_distance = round(latest_atr * ATR_TARGET_MULTIPLIER, 5)
-
-    if stop_distance <= 0 or target_distance <= 0:
-        return None
-
-    if signal_type == "BUY":
-        sl = round(entry - stop_distance, 5)
-        tp = round(entry + target_distance, 5)
-    else:
-        sl = round(entry + stop_distance, 5)
-        tp = round(entry - target_distance, 5)
-
+    entry = round(live["ask"] if sig == "BUY" else live["bid"], 5)
+    stop_dist = round(atr_val * ATR_STOP_MULTIPLIER, 5)
+    target_dist = round(atr_val * ATR_TARGET_MULTIPLIER, 5)
+    sl = round(entry - stop_dist, 5) if sig == "BUY" else round(entry + stop_dist, 5)
+    tp = round(entry + target_dist, 5) if sig == "BUY" else round(entry - target_dist, 5)
     lot_size = calculate_position_size(entry, sl)
     if lot_size <= 0:
         return None
 
     return {
         "pair": name,
-        "symbol": symbol,
-        "type": signal_type,
+        "epic": epic,
+        "type": sig,
         "entry": entry,
         "sl": sl,
         "tp": tp,
-        "atr": round(latest_atr, 5),
-        "rsi": round(latest_rsi, 2),
+        "atr": round(atr_val, 5),
+        "rsi": round(rsi_val, 2),
         "lot_size": lot_size,
-        "risk_per_unit": round(abs(entry - sl), 5),
-        "spread": live["spread"],
+        "risk_per_unit": abs(entry - sl),
+        "spread": live["spread"]
     }
 
 def open_trade(signal: Dict):
     order_id = broker.place_order(
-        symbol=signal["symbol"],
-        order_type=signal["type"],
-        units=signal["lot_size"],
-        entry=signal["entry"],
-        sl=signal["sl"],
-        tp=signal["tp"]
+        signal["epic"], signal["type"], signal["lot_size"],
+        signal["entry"], signal["sl"], signal["tp"]
     )
-    if order_id is None:
-        logger.error("Failed to place order for %s", signal["pair"])
+    if not order_id:
+        logger.error(f"Order failed for {signal['pair']}")
         return
 
     trade = {
         "pair": signal["pair"],
-        "symbol": signal["symbol"],
+        "epic": signal["epic"],
         "type": signal["type"],
         "entry": signal["entry"],
         "sl": signal["sl"],
@@ -518,182 +455,124 @@ def open_trade(signal: Dict):
         "break_even_done": False,
         "entry_atr": signal["atr"],
         "lot_size": signal["lot_size"],
-        "broker_order_id": order_id,
+        "deal_ref": order_id
     }
     trades.append(trade)
     last_trade_times[signal["pair"]] = time.time()
     save_open_state()
+    send_telegram(f"🔔 {signal['pair']} {signal['type']}\nEntry: {signal['entry']}\nSL: {signal['sl']}\nTP: {signal['tp']}")
 
-    send_telegram(
-        f"🔔 SNIPER SIGNAL\n\n"
-        f"{signal['pair']} {signal['type']}\n"
-        f"Entry: {signal['entry']}\n"
-        f"SL: {signal['sl']}\n"
-        f"TP: {signal['tp']}\n"
-        f"ATR: {signal['atr']}\n"
-        f"RSI: {signal['rsi']}\n"
-        f"Spread: {signal['spread']}\n"
-        f"Lot Size: {signal['lot_size']}\n"
-        f"Equity: {round(current_equity,2)}"
-    )
-
-def update_trade_status(trade: Dict, latest_price: float):
+def update_trade_status(trade: Dict, live: Dict):
     if trade["status"] != "OPEN":
         return
 
+    price = live["bid"] if trade["type"] == "BUY" else live["ask"]
     risk = trade["risk_per_unit"]
-    entry_atr = trade["entry_atr"]
-    if risk <= 0 or entry_atr <= 0:
+    if risk <= 0:
         return
 
     if trade["type"] == "BUY":
-        progress_r = (latest_price - trade["entry"]) / risk
-    else:
-        progress_r = (trade["entry"] - latest_price) / risk
-
-    if progress_r >= BREAK_EVEN_TRIGGER_R and not trade["break_even_done"]:
-        if trade["type"] == "BUY":
+        progress = (price - trade["entry"]) / risk
+        if progress >= BREAK_EVEN_TRIGGER_R and not trade["break_even_done"]:
             trade["sl"] = max(trade["sl"], trade["entry"])
-        else:
-            trade["sl"] = min(trade["sl"], trade["entry"])
-        trade["break_even_done"] = True
-        send_telegram(f"{trade['pair']} moved to break-even at {trade['sl']}")
-        save_open_state()
-
-    trail_distance = entry_atr * TRAILING_STOP_ATR_MULTIPLIER
-    if trade["break_even_done"]:
-        if trade["type"] == "BUY":
-            new_sl = latest_price - trail_distance
+            trade["break_even_done"] = True
+        if trade["break_even_done"]:
+            new_sl = price - trade["entry_atr"] * TRAILING_STOP_ATR_MULTIPLIER
             if new_sl > trade["sl"]:
                 trade["sl"] = round(new_sl, 5)
-                logger.info(f"{trade['pair']} trailing stop updated to {trade['sl']}")
-        else:
-            new_sl = latest_price + trail_distance
+        if price >= trade["tp"]:
+            trade["status"] = "WIN"
+            save_trade_result(trade, "WIN", price)
+        elif price <= trade["sl"]:
+            trade["status"] = "LOSS"
+            save_trade_result(trade, "LOSS", price)
+    else:
+        progress = (trade["entry"] - price) / risk
+        if progress >= BREAK_EVEN_TRIGGER_R and not trade["break_even_done"]:
+            trade["sl"] = min(trade["sl"], trade["entry"])
+            trade["break_even_done"] = True
+        if trade["break_even_done"]:
+            new_sl = price + trade["entry_atr"] * TRAILING_STOP_ATR_MULTIPLIER
             if new_sl < trade["sl"]:
                 trade["sl"] = round(new_sl, 5)
-                logger.info(f"{trade['pair']} trailing stop updated to {trade['sl']}")
-        save_open_state()
-
-    if trade["type"] == "BUY":
-        if latest_price >= trade["tp"]:
+        if price <= trade["tp"]:
             trade["status"] = "WIN"
-            save_trade_result(trade, "WIN", latest_price)
-        elif latest_price <= trade["sl"]:
+            save_trade_result(trade, "WIN", price)
+        elif price >= trade["sl"]:
             trade["status"] = "LOSS"
-            save_trade_result(trade, "LOSS", latest_price)
-    else:
-        if latest_price <= trade["tp"]:
-            trade["status"] = "WIN"
-            save_trade_result(trade, "WIN", latest_price)
-        elif latest_price >= trade["sl"]:
-            trade["status"] = "LOSS"
-            save_trade_result(trade, "LOSS", latest_price)
+            save_trade_result(trade, "LOSS", price)
 
 def check_trades():
-    for trade in list(trades):
-        if trade["status"] != "OPEN":
+    for t in trades:
+        if t["status"] != "OPEN":
             continue
-        live = get_live_price(trade["symbol"])
-        if live is None or not live["tradeable"]:
-            continue
-        price = live["bid"] if trade["type"] == "BUY" else live["ask"]
-        if not is_valid_number(price):
-            continue
-        update_trade_status(trade, price)
-
+        live = broker.get_live_price(t["epic"])
+        if live:
+            update_trade_status(t, live)
     save_open_state()
 
-# -------------------- Scanning --------------------
 def scan_market():
     if not in_optimal_session():
-        logger.info("Market scan skipped: outside preferred session.")
         return
     if active_trade_count() >= MAX_ACTIVE_TRADES:
-        logger.info("Market scan skipped: max active trades reached.")
         return
-
-    signals = []
-    for name, symbol in pairs.items():
+    for name, epic in pairs.items():
         if has_open_trade(name) or not cooldown_ready(name):
             continue
-        sig = build_signal(name, symbol)
+        sig = build_signal(name, epic)
         if sig:
-            signals.append(sig)
-            logger.info(f"Signal generated for {name}")
+            open_trade(sig)
+            if active_trade_count() >= MAX_ACTIVE_TRADES:
+                break
 
-    if not signals:
-        logger.info("No valid signals this cycle.")
-        return
-
-    slots = MAX_ACTIVE_TRADES - active_trade_count()
-    for sig in signals[:slots]:
-        open_trade(sig)
-
-# -------------------- Reporting --------------------
 def send_heartbeat():
-    open_count = active_trade_count()
-    send_telegram(
-        f"💓 Bot Alive\n"
-        f"Open Trades: {open_count}\n"
-        f"Equity: {round(current_equity,2)}\n"
-        f"Time UTC: {now_utc().strftime('%Y-%m-%d %H:%M:%S')}"
-    )
+    eq = broker.get_account_balance() if broker else 0
+    send_telegram(f"💓 Alive | Trades: {active_trade_count()} | Equity: {round(eq,2)}")
 
 def send_performance():
     total = wins + losses
-    winrate = (wins / total * 100) if total > 0 else 0
-    send_telegram(
-        f"📊 PERFORMANCE\n\n"
-        f"Wins: {wins}\n"
-        f"Losses: {losses}\n"
-        f"Win Rate: {round(winrate,2)}%\n"
-        f"Open Trades: {active_trade_count()}\n"
-        f"Current Equity: {round(current_equity,2)}"
-    )
+    wr = (wins / total * 100) if total > 0 else 0
+    send_telegram(f"📊 Wins: {wins} | Losses: {losses} | Win Rate: {round(wr,1)}%")
 
-# -------------------- Main Loop --------------------
+# -------------------- Main --------------------
 def run_bot():
+    global broker
     setup_files()
     load_state()
-    logger.info("Bot started. Equity: %.2f, Wins: %d, Losses: %d", current_equity, wins, losses)
+
+    if not all([CAPITAL_API_KEY, CAPITAL_LOGIN, CAPITAL_PASSWORD]):
+        logger.error("Capital.com credentials not set! Please set CAPITAL_API_KEY, CAPITAL_LOGIN, and CAPITAL_PASSWORD")
+        return
+
+    broker = CapitalBroker(CAPITAL_API_KEY, CAPITAL_LOGIN, CAPITAL_PASSWORD)
     
-    # Send startup message
-    send_telegram(f"🚀 Bot Started\nEquity: {round(current_equity,2)}\nTime: {now_utc().strftime('%Y-%m-%d %H:%M:%S')} UTC")
+    # Top up demo account if balance is low
+    balance = broker.get_account_balance()
+    if balance < 1000:
+        broker.top_up_demo(5000)
+    
+    logger.info(f"Bot started. Equity: {broker.get_account_balance()}")
+    send_telegram("🚀 Capital.com Demo Bot Started")
 
-    last_scan = 0
-    last_heartbeat = 0
-    last_report = 0
-    last_trade_check = 0
-
+    last_scan = last_heartbeat = last_report = last_check = 0
     while True:
         try:
             now = time.time()
-
             if now - last_scan >= SCAN_INTERVAL_SECONDS:
-                logger.info("Scanning market...")
                 scan_market()
                 last_scan = now
-
-            if now - last_trade_check >= TRADE_CHECK_INTERVAL_SECONDS:
+            if now - last_check >= TRADE_CHECK_INTERVAL_SECONDS:
                 check_trades()
-                last_trade_check = now
-
+                last_check = now
             if now - last_heartbeat >= HEARTBEAT_INTERVAL_SECONDS:
                 send_heartbeat()
                 last_heartbeat = now
-
             if now - last_report >= REPORT_INTERVAL_SECONDS:
                 send_performance()
                 last_report = now
-
         except Exception as e:
-            logger.exception("Unhandled error in main loop: %s", e)
-            send_telegram(f"⚠️ Bot error: {e}")
-
+            logger.exception(f"Error: {e}")
         time.sleep(1)
 
 if __name__ == "__main__":
-    if not TWELVE_DATA_API_KEY:
-        logger.error("TWELVE_DATA_API_KEY missing. Please set it in environment variables.")
-        exit(1)
     run_bot()
