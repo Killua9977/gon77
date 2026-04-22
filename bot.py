@@ -3,7 +3,6 @@ import logging
 import math
 import os
 import time
-import json
 from datetime import datetime, timezone
 from typing import Dict, List, Optional
 
@@ -15,7 +14,7 @@ TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 CAPITAL_API_KEY = os.getenv("CAPITAL_API_KEY", "").strip()
 CAPITAL_LOGIN = os.getenv("CAPITAL_LOGIN", "").strip()
-CAPITAL_PASSWORD = os.getenv("CAPITAL_PASSWORD", "").strip()  # This must be your API password!
+CAPITAL_PASSWORD = os.getenv("CAPITAL_PASSWORD", "").strip()
 
 # Strategy Parameters
 INITIAL_EQUITY = float(os.getenv("INITIAL_EQUITY", "1000.0"))
@@ -38,18 +37,18 @@ STATE_FILE = "trade_state.csv"
 RESULTS_FILE = "trade_results.csv"
 LOG_FILE = "bot.log"
 
-# Capital.com EPIC codes for forex pairs
+# Capital.com EPIC codes for forex pairs (CFD version)
 pairs = {
-    "EURUSD": "CS.D.EURUSD.MINI.IP",
-    "GBPUSD": "CS.D.GBPUSD.MINI.IP",
-    "USDJPY": "CS.D.USDJPY.MINI.IP",
-    "USDCHF": "CS.D.USDCHF.MINI.IP",
-    "AUDUSD": "CS.D.AUDUSD.MINI.IP",
-    "USDCAD": "CS.D.USDCAD.MINI.IP",
-    "NZDUSD": "CS.D.NZDUSD.MINI.IP",
-    "EURGBP": "CS.D.EURGBP.MINI.IP",
-    "EURJPY": "CS.D.EURJPY.MINI.IP",
-    "GBPJPY": "CS.D.GBPJPY.MINI.IP",
+    "EURUSD": "CS.D.EURUSD.CFD.IP",
+    "GBPUSD": "CS.D.GBPUSD.CFD.IP",
+    "USDJPY": "CS.D.USDJPY.CFD.IP",
+    "USDCHF": "CS.D.USDCHF.CFD.IP",
+    "AUDUSD": "CS.D.AUDUSD.CFD.IP",
+    "USDCAD": "CS.D.USDCAD.CFD.IP",
+    "NZDUSD": "CS.D.NZDUSD.CFD.IP",
+    "EURGBP": "CS.D.EURGBP.CFD.IP",
+    "EURJPY": "CS.D.EURJPY.CFD.IP",
+    "GBPJPY": "CS.D.GBPJPY.CFD.IP",
 }
 
 # -------------------- Logging Setup --------------------
@@ -66,7 +65,7 @@ logger = logging.getLogger(__name__)
 # -------------------- Capital.com Direct API Client --------------------
 class CapitalClient:
     """Direct REST API client for Capital.com."""
-    
+
     def __init__(self, api_key: str, login: str, password: str, demo: bool = True):
         self.api_key = api_key
         self.login = login
@@ -76,7 +75,7 @@ class CapitalClient:
         self.security_token = None
         self.session = requests.Session()
         self.authenticate()
-    
+
     def authenticate(self):
         """Create a session with Capital.com API."""
         try:
@@ -90,23 +89,23 @@ class CapitalClient:
                 "password": self.password,
                 "encryptedPassword": False
             }
-            
+
             response = self.session.post(url, headers=headers, json=data, timeout=30)
-            
+
             if response.status_code != 200:
                 error_msg = response.json().get('errorMessage', 'Unknown error')
                 raise Exception(f"Authentication failed: {error_msg}")
-            
+
             self.cst = response.headers.get("CST")
             self.security_token = response.headers.get("X-SECURITY-TOKEN")
-            
+
             logger.info("✅ Connected to Capital.com Demo Account")
             return True
-            
+
         except Exception as e:
             logger.error(f"Failed to connect to Capital.com: {e}")
             raise
-    
+
     def _make_request(self, method: str, endpoint: str, data: Dict = None) -> Optional[Dict]:
         """Make authenticated request to Capital.com API."""
         try:
@@ -117,7 +116,7 @@ class CapitalClient:
                 "X-SECURITY-TOKEN": self.security_token,
                 "Content-Type": "application/json"
             }
-            
+
             if method == "GET":
                 response = self.session.get(url, headers=headers, timeout=30)
             elif method == "POST":
@@ -126,19 +125,19 @@ class CapitalClient:
                 response = self.session.delete(url, headers=headers, timeout=30)
             else:
                 return None
-            
+
             if response.status_code in [401, 403]:
                 # Session expired, re-authenticate
                 logger.info("Session expired, re-authenticating...")
                 self.authenticate()
                 return self._make_request(method, endpoint, data)
-            
+
             if response.status_code != 200:
                 logger.error(f"API error: {response.status_code} - {response.text}")
                 return None
-            
+
             return response.json()
-            
+
         except Exception as e:
             logger.error(f"Request failed: {e}")
             return None
@@ -149,10 +148,11 @@ class CapitalClient:
         try:
             endpoint = f"/api/v1/prices/{epic}?resolution={resolution}&max={num_candles}"
             data = self._make_request("GET", endpoint)
-            
+
             if not data or 'prices' not in data:
+                logger.warning(f"No candle data for {epic} (may be invalid epic)")
                 return None
-            
+
             rows = []
             for candle in data['prices']:
                 rows.append({
@@ -162,15 +162,15 @@ class CapitalClient:
                     "Low": float(candle['lowPrice']['bid']),
                     "Close": float(candle['closePrice']['bid']),
                 })
-            
+
             if not rows:
                 return None
-                
+
             df = pd.DataFrame(rows)
             df["time"] = pd.to_datetime(df["time"])
             df.set_index("time", inplace=True)
             return df.dropna()
-            
+
         except Exception as e:
             logger.error(f"Failed to get candles for {epic}: {e}")
             return None
@@ -180,15 +180,16 @@ class CapitalClient:
         try:
             endpoint = f"/api/v1/markets/{epic}"
             data = self._make_request("GET", endpoint)
-            
+
             if not data or 'snapshot' not in data:
+                logger.warning(f"No market data for {epic}")
                 return None
-            
+
             snapshot = data['snapshot']
             bid = float(snapshot['bid'])
             ask = float(snapshot['offer'])
             mid = (bid + ask) / 2
-            
+
             return {
                 "bid": bid,
                 "ask": ask,
@@ -206,19 +207,19 @@ class CapitalClient:
         """Place a market order with stop loss and take profit."""
         try:
             direction = "BUY" if order_type == "BUY" else "SELL"
-            
+
             # Calculate stop and limit distances
             pip_size = 0.0001
             if "JPY" in epic:
                 pip_size = 0.01
-                
+
             if direction == "BUY":
                 stop_distance = int(abs(entry - sl) / pip_size)
                 limit_distance = int(abs(tp - entry) / pip_size)
             else:
                 stop_distance = int(abs(sl - entry) / pip_size)
                 limit_distance = int(abs(entry - tp) / pip_size)
-            
+
             endpoint = "/api/v1/positions"
             data = {
                 "epic": epic,
@@ -229,15 +230,15 @@ class CapitalClient:
                 "guaranteedStop": False,
                 "forceOpen": True
             }
-            
+
             result = self._make_request("POST", endpoint, data)
-            
+
             if result and 'dealReference' in result:
                 logger.info(f"Order placed: {order_type} {units} {epic}")
                 return result['dealReference']
-            
+
             return None
-            
+
         except Exception as e:
             logger.error(f"Failed to place order for {epic}: {e}")
             return None
@@ -247,7 +248,7 @@ class CapitalClient:
         try:
             endpoint = "/api/v1/accounts"
             data = self._make_request("GET", endpoint)
-            
+
             if data and 'accounts' in data and len(data['accounts']) > 0:
                 return float(data['accounts'][0]['balance']['balance'])
             return 0.0
@@ -427,8 +428,10 @@ def build_signal(name: str, epic: str) -> Optional[Dict]:
     if atr_val <= 0:
         return None
     if live["spread"] > atr_val * MAX_SPREAD_TO_ATR_RATIO:
+        logger.info(f"{name}: spread too high ({live['spread']} > {atr_val * MAX_SPREAD_TO_ATR_RATIO})")
         return None
     if abs(e20_15 - e50_15) < atr_val * 0.25:
+        logger.info(f"{name}: trend too weak (gap {abs(e20_15 - e50_15)} < {atr_val * 0.25})")
         return None
 
     sig = None
@@ -508,6 +511,7 @@ def update_trade_status(trade: Dict, live: Dict):
         if progress >= BREAK_EVEN_TRIGGER_R and not trade["break_even_done"]:
             trade["sl"] = max(trade["sl"], trade["entry"])
             trade["break_even_done"] = True
+            send_telegram(f"{trade['pair']} moved to break-even at {trade['sl']}")
         if trade["break_even_done"]:
             new_sl = price - trade["entry_atr"] * TRAILING_STOP_ATR_MULTIPLIER
             if new_sl > trade["sl"]:
@@ -523,6 +527,7 @@ def update_trade_status(trade: Dict, live: Dict):
         if progress >= BREAK_EVEN_TRIGGER_R and not trade["break_even_done"]:
             trade["sl"] = min(trade["sl"], trade["entry"])
             trade["break_even_done"] = True
+            send_telegram(f"{trade['pair']} moved to break-even at {trade['sl']}")
         if trade["break_even_done"]:
             new_sl = price + trade["entry_atr"] * TRAILING_STOP_ATR_MULTIPLIER
             if new_sl < trade["sl"]:
@@ -545,19 +550,25 @@ def check_trades():
 
 def scan_market():
     if not in_optimal_session():
+        logger.info("Market scan skipped: outside preferred session")
         return
     if active_trade_count() >= MAX_ACTIVE_TRADES:
+        logger.info("Market scan skipped: max active trades reached")
         return
-    
+
     logger.info("Scanning market for signals...")
     for name, epic in pairs.items():
         if has_open_trade(name) or not cooldown_ready(name):
             continue
-        sig = build_signal(name, epic)
-        if sig:
-            open_trade(sig)
-            if active_trade_count() >= MAX_ACTIVE_TRADES:
-                break
+        try:
+            sig = build_signal(name, epic)
+            if sig:
+                open_trade(sig)
+                if active_trade_count() >= MAX_ACTIVE_TRADES:
+                    break
+        except Exception as e:
+            logger.error(f"Error scanning {name} ({epic}): {e}")
+            continue
 
 def send_heartbeat():
     eq = broker.get_account_balance() if broker else 0
@@ -579,7 +590,7 @@ def run_bot():
         return
 
     broker = CapitalClient(CAPITAL_API_KEY, CAPITAL_LOGIN, CAPITAL_PASSWORD, demo=True)
-    
+
     balance = broker.get_account_balance()
     logger.info(f"Bot started. Equity: ${balance}")
     send_telegram(f"🚀 Capital.com Demo Bot Started\nEquity: ${round(balance,2)}")
@@ -601,7 +612,8 @@ def run_bot():
                 send_performance()
                 last_report = now
         except Exception as e:
-            logger.exception(f"Error: {e}")
+            logger.exception(f"Error in main loop: {e}")
+            send_telegram(f"⚠️ Bot error: {e}")
         time.sleep(1)
 
 if __name__ == "__main__":
