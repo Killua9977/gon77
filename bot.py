@@ -24,7 +24,7 @@ ATR_STOP_MULTIPLIER = float(os.getenv("ATR_STOP_MULTIPLIER", "1.5"))
 ATR_TARGET_MULTIPLIER = float(os.getenv("ATR_TARGET_MULTIPLIER", "2.4"))
 BREAK_EVEN_TRIGGER_R = float(os.getenv("BREAK_EVEN_TRIGGER_R", "1.0"))
 TRAILING_STOP_ATR_MULTIPLIER = float(os.getenv("TRAILING_STOP_ATR_MULTIPLIER", "1.2"))
-MAX_SPREAD_TO_ATR_RATIO = float(os.getenv("MAX_SPREAD_TO_ATR_RATIO", "0.20"))
+MAX_SPREAD_TO_ATR_RATIO = float(os.getenv("MAX_SPREAD_TO_ATR_RATIO", "0.20"))  # Slightly relaxed
 PAIR_COOLDOWN_SECONDS = int(os.getenv("PAIR_COOLDOWN_SECONDS", "14400"))
 
 # Timing
@@ -37,7 +37,7 @@ STATE_FILE = "trade_state.csv"
 RESULTS_FILE = "trade_results.csv"
 LOG_FILE = "bot.log"
 
-# This dictionary now holds search terms, not direct EPICs.
+# Search terms for Capital.com (bot auto-discovers EPICs)
 pairs = {
     "EURUSD": "EURUSD",
     "GBPUSD": "GBPUSD",
@@ -74,11 +74,10 @@ class CapitalClient:
         self.cst = None
         self.security_token = None
         self.session = requests.Session()
-        self.epic_cache = {}  # Cache search_term -> epic
+        self.epic_cache = {}
         self.authenticate()
 
     def authenticate(self):
-        """Create a session with Capital.com API."""
         try:
             url = f"{self.base_url}/api/v1/session"
             headers = {
@@ -108,7 +107,6 @@ class CapitalClient:
             raise
 
     def _make_request(self, method: str, endpoint: str, data: Dict = None) -> Optional[Dict]:
-        """Make authenticated request to Capital.com API."""
         try:
             url = f"{self.base_url}{endpoint}"
             headers = {
@@ -128,7 +126,6 @@ class CapitalClient:
                 return None
 
             if response.status_code in [401, 403]:
-                # Session expired, re-authenticate
                 logger.info("Session expired, re-authenticating...")
                 self.authenticate()
                 return self._make_request(method, endpoint, data)
@@ -144,7 +141,6 @@ class CapitalClient:
             return None
 
     def get_epic(self, search_term: str) -> Optional[str]:
-        """Search for a market epic using a search term (e.g., 'EURJPY')."""
         if search_term in self.epic_cache:
             return self.epic_cache[search_term]
 
@@ -163,9 +159,7 @@ class CapitalClient:
             logger.error(f"Failed to search for epic '{search_term}': {e}")
             return None
 
-    # -------------------- Data Methods --------------------
     def get_candles(self, epic: str, resolution: str = "MINUTE_15", num_candles: int = 300) -> Optional[pd.DataFrame]:
-        """Fetch historical candles from Capital.com."""
         try:
             endpoint = f"/api/v1/prices/{epic}?resolution={resolution}&max={num_candles}"
             data = self._make_request("GET", endpoint)
@@ -197,7 +191,6 @@ class CapitalClient:
             return None
 
     def get_live_price(self, epic: str) -> Optional[Dict]:
-        """Get current bid/ask for a symbol."""
         try:
             endpoint = f"/api/v1/markets/{epic}"
             data = self._make_request("GET", endpoint)
@@ -222,14 +215,11 @@ class CapitalClient:
             logger.error(f"Failed to get live price for {epic}: {e}")
             return None
 
-    # -------------------- Trading Methods --------------------
     def place_order(self, epic: str, order_type: str, units: float,
                     entry: float, sl: float, tp: float) -> Optional[str]:
-        """Place a market order with stop loss and take profit."""
         try:
             direction = "BUY" if order_type == "BUY" else "SELL"
 
-            # Calculate stop and limit distances
             pip_size = 0.0001
             if "JPY" in epic:
                 pip_size = 0.01
@@ -265,7 +255,6 @@ class CapitalClient:
             return None
 
     def get_account_balance(self) -> float:
-        """Get current account balance."""
         try:
             endpoint = "/api/v1/accounts"
             data = self._make_request("GET", endpoint)
@@ -317,10 +306,20 @@ def calculate_atr(df, period=14):
     tr = (high - low).combine((high - prev_close).abs(), max).combine((low - prev_close).abs(), max)
     return tr.ewm(alpha=1/period, adjust=False).mean()
 
-# -------------------- Session Filter --------------------
-def in_optimal_session():
+# -------------------- Session Filter (EXPANDED) --------------------
+def in_optimal_session() -> bool:
+    """Trade during Asian, London, and NY sessions (00:00–17:00 UTC)."""
     now = now_utc()
-    return now.weekday() < 5 and 12 <= now.hour < 16
+    
+    # Skip weekends
+    if now.weekday() >= 5:
+        return False
+    
+    hour = now.hour
+    
+    # Covers Asian (00:00–03:00), London (08:00–12:00), London/NY overlap (12:00–16:00)
+    # Skips only the quietest period (17:00–00:00)
+    return 0 <= hour < 17
 
 # -------------------- Global State --------------------
 trades: List[Dict] = []
@@ -571,7 +570,7 @@ def check_trades():
 
 def scan_market():
     if not in_optimal_session():
-        logger.info("Market scan skipped: outside preferred session")
+        logger.info("Market scan skipped: outside trading session")
         return
     if active_trade_count() >= MAX_ACTIVE_TRADES:
         logger.info("Market scan skipped: max active trades reached")
