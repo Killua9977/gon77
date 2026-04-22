@@ -37,18 +37,18 @@ STATE_FILE = "trade_state.csv"
 RESULTS_FILE = "trade_results.csv"
 LOG_FILE = "bot.log"
 
-# Capital.com EPIC codes for forex pairs (CFD version)
+# This dictionary now holds search terms, not direct EPICs.
 pairs = {
-    "EURUSD": "CS.D.EURUSD.CFD.IP",
-    "GBPUSD": "CS.D.GBPUSD.CFD.IP",
-    "USDJPY": "CS.D.USDJPY.CFD.IP",
-    "USDCHF": "CS.D.USDCHF.CFD.IP",
-    "AUDUSD": "CS.D.AUDUSD.CFD.IP",
-    "USDCAD": "CS.D.USDCAD.CFD.IP",
-    "NZDUSD": "CS.D.NZDUSD.CFD.IP",
-    "EURGBP": "CS.D.EURGBP.CFD.IP",
-    "EURJPY": "CS.D.EURJPY.CFD.IP",
-    "GBPJPY": "CS.D.GBPJPY.CFD.IP",
+    "EURUSD": "EURUSD",
+    "GBPUSD": "GBPUSD",
+    "USDJPY": "USDJPY",
+    "USDCHF": "USDCHF",
+    "AUDUSD": "AUDUSD",
+    "USDCAD": "USDCAD",
+    "NZDUSD": "NZDUSD",
+    "EURGBP": "EURGBP",
+    "EURJPY": "EURJPY",
+    "GBPJPY": "GBPJPY",
 }
 
 # -------------------- Logging Setup --------------------
@@ -74,6 +74,7 @@ class CapitalClient:
         self.cst = None
         self.security_token = None
         self.session = requests.Session()
+        self.epic_cache = {}  # Cache search_term -> epic
         self.authenticate()
 
     def authenticate(self):
@@ -142,6 +143,26 @@ class CapitalClient:
             logger.error(f"Request failed: {e}")
             return None
 
+    def get_epic(self, search_term: str) -> Optional[str]:
+        """Search for a market epic using a search term (e.g., 'EURJPY')."""
+        if search_term in self.epic_cache:
+            return self.epic_cache[search_term]
+
+        try:
+            endpoint = f"/api/v1/markets?searchTerm={search_term}"
+            data = self._make_request("GET", endpoint)
+            if data and 'markets' in data and len(data['markets']) > 0:
+                epic = data['markets'][0]['epic']
+                self.epic_cache[search_term] = epic
+                logger.info(f"Found epic '{epic}' for search term '{search_term}'")
+                return epic
+            else:
+                logger.warning(f"No market found for search term '{search_term}'")
+                return None
+        except Exception as e:
+            logger.error(f"Failed to search for epic '{search_term}': {e}")
+            return None
+
     # -------------------- Data Methods --------------------
     def get_candles(self, epic: str, resolution: str = "MINUTE_15", num_candles: int = 300) -> Optional[pd.DataFrame]:
         """Fetch historical candles from Capital.com."""
@@ -150,7 +171,7 @@ class CapitalClient:
             data = self._make_request("GET", endpoint)
 
             if not data or 'prices' not in data:
-                logger.warning(f"No candle data for {epic} (may be invalid epic)")
+                logger.warning(f"No candle data for {epic}")
                 return None
 
             rows = []
@@ -557,17 +578,21 @@ def scan_market():
         return
 
     logger.info("Scanning market for signals...")
-    for name, epic in pairs.items():
+    for name, search_term in pairs.items():
         if has_open_trade(name) or not cooldown_ready(name):
             continue
         try:
+            epic = broker.get_epic(search_term)
+            if not epic:
+                logger.warning(f"Could not find epic for {name} ({search_term}), skipping")
+                continue
             sig = build_signal(name, epic)
             if sig:
                 open_trade(sig)
                 if active_trade_count() >= MAX_ACTIVE_TRADES:
                     break
         except Exception as e:
-            logger.error(f"Error scanning {name} ({epic}): {e}")
+            logger.error(f"Error scanning {name} ({search_term}): {e}")
             continue
 
 def send_heartbeat():
