@@ -19,7 +19,7 @@ CAPITAL_PASSWORD = os.getenv("CAPITAL_PASSWORD", "").strip()
 # Strategy Parameters
 INITIAL_EQUITY = float(os.getenv("INITIAL_EQUITY", "1000.0"))
 RISK_PERCENT = float(os.getenv("RISK_PERCENT", "2.0"))
-MAX_ACTIVE_TRADES = int(os.getenv("MAX_ACTIVE_TRADES", "3"))
+MAX_ACTIVE_TRADES = int(os.getenv("MAX_ACTIVE_TRADES", "10"))
 ATR_STOP_MULTIPLIER = float(os.getenv("ATR_STOP_MULTIPLIER", "1.5"))
 ATR_TARGET_MULTIPLIER = float(os.getenv("ATR_TARGET_MULTIPLIER", "2.4"))
 BREAK_EVEN_TRIGGER_R = float(os.getenv("BREAK_EVEN_TRIGGER_R", "1.0"))
