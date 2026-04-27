@@ -380,19 +380,72 @@ class CapitalClient:
 
     def place_order(self, epic: str, direction: str, units: float,
                     entry: float, sl: float, tp: float) -> Optional[str]:
-        pip = 0.01 if "JPY" in epic else (1.0 if any(x in epic for x in ["US500","US30","USTEC"])
-              else (0.1 if "XAU" in epic else 0.0001))
-        result = self._req("POST", "/api/v1/positions", {
-            "epic": epic, "direction": direction, "size": units,
-            "stopDistance":  max(int(abs(entry-sl) / pip), 1),
-            "limitDistance": max(int(abs(tp-entry) / pip), 1),
-            "guaranteedStop": False, "forceOpen": True
-        })
-        return result.get("dealReference") if result else None
+        """
+        FIX v3.1: Use absolute price levels (stopLevel/limitLevel) instead of
+        pip distances. The old stopDistance/limitDistance approach was silently
+        rejected by Capital.com for many instruments, causing trades to open
+        with no TP — only SL.
+        """
+        try:
+            payload = {
+                "epic":           epic,
+                "direction":      direction,
+                "size":           units,
+                "stopLevel":      round(sl, 5),   # absolute SL price
+                "limitLevel":     round(tp, 5),   # absolute TP price
+                "guaranteedStop": False,
+                "forceOpen":      True
+            }
+
+            logger.info(
+                f"Placing order: {direction} {units} {epic} | "
+                f"SL={round(sl,5)} TP={round(tp,5)}"
+            )
+
+            result = self._req("POST", "/api/v1/positions", payload)
+
+            if not result:
+                logger.error(f"Order rejected by broker for {epic} — empty response")
+                return None
+
+            # Log full broker response for debugging
+            logger.info(f"Broker response: {result}")
+
+            deal_ref = result.get("dealReference")
+            if deal_ref:
+                logger.info(f"✅ Order accepted: {direction} {units} {epic} | ref={deal_ref}")
+                return deal_ref
+
+            # If no dealReference, log the error reason
+            logger.error(f"No dealReference in response for {epic}: {result}")
+            return None
+
+        except Exception as e:
+            logger.error(f"place_order error for {epic}: {e}")
+            return None
 
     def confirm_fill(self, deal_ref: str) -> Optional[Dict]:
+        """Confirm order was filled and verify SL/TP were accepted."""
         data = self._req("GET", f"/api/v1/confirms/{deal_ref}")
-        return data if data and data.get("status") in ["OPEN","ACCEPTED"] else None
+        if not data:
+            return None
+
+        logger.info(f"Fill confirmation for {deal_ref}: {data}")
+
+        status = data.get("status", "")
+        if status not in ["OPEN", "ACCEPTED"]:
+            logger.warning(f"Deal {deal_ref} status: {status} — may not have filled")
+            return None
+
+        # Warn if TP or SL missing from confirmation
+        if not data.get("limitLevel"):
+            logger.warning(f"⚠️ No limitLevel (TP) confirmed for {deal_ref} — check Capital.com!")
+            send_telegram(f"⚠️ Warning: TP not confirmed by broker for ref={deal_ref}\nCheck Capital.com manually!")
+
+        if not data.get("stopLevel"):
+            logger.warning(f"⚠️ No stopLevel (SL) confirmed for {deal_ref}")
+
+        return data
 
     def get_account_balance(self) -> float:
         data = self._req("GET", "/api/v1/accounts")
