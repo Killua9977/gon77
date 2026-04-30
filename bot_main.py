@@ -489,8 +489,8 @@ class CapitalClient:
             "epic":           epic,
             "direction":      direction,
             "size":           units,
-            "stopLevel":      sl_r,
-            "limitLevel":     tp_r,
+            "stopLevel":      float(sl_r),
+            "limitLevel":     float(tp_r),
             "guaranteedStop": False,
             "forceOpen":      True
         }
@@ -508,8 +508,8 @@ class CapitalClient:
             "epic":           epic,
             "direction":      direction,
             "size":           units,
-            "stopDistance":   round(sl_dist, decimals),
-            "limitDistance":  round(tp_dist, decimals),
+            "stopDistance":   float(round(sl_dist, decimals)),
+            "limitDistance":  float(round(tp_dist, decimals)),
             "guaranteedStop": False,
             "forceOpen":      True
         }
@@ -526,8 +526,8 @@ class CapitalClient:
         payload3 = {
             "epic":           epic,
             "direction":      direction,
-            "size":           units,
-            "stopLevel":      sl_r,
+            "size":           float(units),
+            "stopLevel":      float(sl_r),
             "guaranteedStop": False,
             "forceOpen":      True
         }
@@ -549,43 +549,58 @@ class CapitalClient:
 
     def _set_tp_on_position(self, deal_ref: str, tp_level: float, sl_level: float):
         """
-        Sets TP on an already-open position via the positions PATCH endpoint.
-        Used as fallback when TP cannot be set during order placement.
+        Sets TP on existing open position.
+        Capital.com API: PUT /api/v1/positions/{dealId}
+        with body: {"limitLevel": float(tp), "stopLevel": float(sl)}
         """
         try:
-            # Find the deal ID from open positions
             positions = self._req("GET", "/api/v1/positions")
             if not positions:
-                logger.error(f"Cannot fetch positions to set TP for {deal_ref}")
+                logger.error(f"Cannot fetch positions for {deal_ref}")
                 return
 
             for pos in positions.get("positions", []):
                 pos_data = pos.get("position", {})
-                if pos_data.get("dealReference") == deal_ref:
-                    deal_id = pos_data.get("dealId", "")
-                    if not deal_id:
-                        logger.error(f"No dealId found for {deal_ref}")
-                        return
+                if pos_data.get("dealReference") != deal_ref:
+                    continue
 
-                    # Update position with TP
-                    update_payload = {
-                        "limitLevel": tp_level,
-                        "stopLevel":  sl_level,
-                    }
-                    logger.info(f"Setting TP via PATCH: dealId={deal_id} payload={update_payload}")
-                    result = self._req("PUT", f"/api/v1/positions/{deal_id}", update_payload)
-                    logger.info(f"TP set response: {result}")
-
-                    if result:
-                        logger.info(f"✅ TP set successfully on {deal_ref}: {tp_level}")
-                        send_telegram(f"✅ TP set on existing position\nref={deal_ref} TP={tp_level}")
-                    else:
-                        logger.error(f"❌ Failed to set TP on {deal_ref}")
-                        send_telegram(f"⚠️ TP could not be set!\nref={deal_ref}\nPlease set TP={tp_level} manually on Capital.com")
+                deal_id = pos_data.get("dealId", "")
+                if not deal_id:
+                    logger.error(f"No dealId for {deal_ref}")
                     return
 
-            logger.warning(f"Position {deal_ref} not found in open positions")
+                logger.info(f"Setting TP via PUT /positions/{deal_id} | TP={tp_level} SL={sl_level}")
 
+                # Capital.com requires both stopLevel and limitLevel together
+                result = self._req("PUT", f"/api/v1/positions/{deal_id}", {
+                    "limitLevel": float(tp_level),
+                    "stopLevel":  float(sl_level),
+                })
+                logger.info(f"PUT result: {result}")
+
+                if result and result.get("dealReference"):
+                    logger.info(f"✅ TP set via PUT: {tp_level}")
+                    send_telegram(f"✅ TP auto-fixed!\nref={deal_ref} TP={tp_level}")
+                else:
+                    # Try without stopLevel — some accounts only need limitLevel
+                    logger.warning("PUT with both levels failed — trying limitLevel only...")
+                    result2 = self._req("PUT", f"/api/v1/positions/{deal_id}", {
+                        "limitLevel": float(tp_level),
+                    })
+                    logger.info(f"PUT limitLevel-only result: {result2}")
+                    if result2 and result2.get("dealReference"):
+                        logger.info(f"✅ TP set (limitLevel only): {tp_level}")
+                        send_telegram(f"✅ TP auto-fixed!\nref={deal_ref} TP={tp_level}")
+                    else:
+                        logger.error(f"❌ All PUT attempts failed for {deal_ref}")
+                        send_telegram(
+                            f"⚠️ Please set TP MANUALLY on Capital.com!\n"
+                            f"Trade: {deal_ref}\n"
+                            f"TP = {tp_level}"
+                        )
+                return
+
+            logger.warning(f"Position {deal_ref} not found in open positions")
         except Exception as e:
             logger.error(f"_set_tp_on_position error: {e}")
 
@@ -638,7 +653,7 @@ class CapitalClient:
             # TP truly missing — set via PUT now
             if tp_level and deal_id:
                 logger.warning(f"Setting TP via PUT: {deal_id} TP={tp_level}")
-                update_payload = {"limitLevel": tp_level}
+                update_payload = {"limitLevel": float(tp_level)}
                 if sl_level:
                     update_payload["stopLevel"] = sl_level
                 result = self._req("PUT", f"/api/v1/positions/{deal_id}", update_payload)
@@ -824,34 +839,35 @@ def find_sr_levels(df: pd.DataFrame, lookback: int = 100,
 
     return sorted(strong_levels)
 
-def adjust_tp_to_sr(tp: float, entry: float, direction: str,
+def adjust_tp_to_sr(tp: float, tp_partial: float, entry: float, direction: str,
                     sr_levels: List[float], atr_val: float) -> float:
     """
     Adjusts TP to sit just before the nearest S/R level in profit direction.
-    If no S/R level is found between entry and TP, returns original TP.
-    This prevents trades from being stopped out at key resistance/support walls.
+    IMPORTANT: adjusted TP must always be BEYOND tp_partial, never between
+    entry and tp_partial — otherwise TP2 ends up below TP1.
     """
     if not sr_levels:
         return tp
 
-    buffer = atr_val * 0.3  # stop just before the S/R level
+    buffer = atr_val * 0.3
 
     if direction == "BUY":
-        # Find S/R levels between entry and original TP
-        walls = [lvl for lvl in sr_levels if entry < lvl < tp]
+        # Only consider walls BEYOND tp_partial (not between entry and tp_partial)
+        walls = [lvl for lvl in sr_levels if tp_partial < lvl < tp]
         if walls:
-            nearest = min(walls)  # first wall the price will hit
+            nearest  = min(walls)
             adjusted = nearest - buffer
-            if adjusted > entry:  # still profitable
-                logger.info(f"TP adjusted BUY: {tp:.5f} → {adjusted:.5f} (S/R wall at {nearest:.5f})")
+            # Must be beyond partial TP and still profitable
+            if adjusted > tp_partial:
+                logger.info(f"S/R TP BUY: {tp:.5f} → {adjusted:.5f} (wall at {nearest:.5f})")
                 return round(adjusted, 5)
     else:
-        walls = [lvl for lvl in sr_levels if tp < lvl < entry]
+        walls = [lvl for lvl in sr_levels if tp < lvl < tp_partial]
         if walls:
-            nearest = max(walls)
+            nearest  = max(walls)
             adjusted = nearest + buffer
-            if adjusted < entry:
-                logger.info(f"TP adjusted SELL: {tp:.5f} → {adjusted:.5f} (S/R wall at {nearest:.5f})")
+            if adjusted < tp_partial:
+                logger.info(f"S/R TP SELL: {tp:.5f} → {adjusted:.5f} (wall at {nearest:.5f})")
                 return round(adjusted, 5)
 
     return tp
@@ -1075,12 +1091,41 @@ def cooldown_ready(pair: str) -> bool:
     last = last_trade_times.get(pair)
     return last is None or (time.time() - last) >= PAIR_COOLDOWN_SECONDS
 
-def calculate_position_size(entry: float, sl: float) -> float:
+# Minimum lot sizes per instrument (Capital.com requirements)
+MIN_LOT_SIZES = {
+    "EURUSD": 1000, "GBPUSD": 1000, "USDJPY": 1000,
+    "GBPJPY": 1000, "USDCHF": 1000, "AUDUSD": 1000,
+    "USDCAD": 1000, "NZDUSD": 1000, "EURGBP": 1000,
+    "EURJPY": 1000,
+    "US500":  1,    "US30":   1,    "USTEC":  1,
+    "XAUUSD": 1,    "XAGUSD": 1,    "USOIL":  1,
+}
+
+# Maximum lot sizes to prevent oversizing
+MAX_LOT_SIZES = {
+    "EURUSD": 50000, "GBPUSD": 50000, "USDJPY": 50000,
+    "GBPJPY": 50000, "USDCHF": 50000, "AUDUSD": 50000,
+    "USDCAD": 50000, "NZDUSD": 50000, "EURGBP": 50000,
+    "EURJPY": 50000,
+    "US500":  100,   "US30":   10,    "USTEC":  50,
+    "XAUUSD": 10,    "XAGUSD": 100,   "USOIL":  100,
+}
+
+def calculate_position_size(pair: str, entry: float, sl: float) -> float:
     equity   = broker.get_account_balance() if broker else INITIAL_EQUITY
     equity   = equity if equity > 0 else INITIAL_EQUITY
     risk_amt = equity * (RISK_PERCENT / 100)
     sl_dist  = abs(entry - sl)
-    return round(risk_amt / sl_dist, 2) if sl_dist > 0 else 0
+    if sl_dist <= 0:
+        return 0
+    size = round(risk_amt / sl_dist, 2)
+    # Enforce min/max lot sizes
+    min_lot = MIN_LOT_SIZES.get(pair, 1000)
+    max_lot = MAX_LOT_SIZES.get(pair, 50000)
+    size    = max(size, min_lot)   # at least minimum
+    size    = min(size, max_lot)   # never exceed maximum
+    logger.info(f"{pair} position size: {size} (min={min_lot} max={max_lot} risk={risk_amt:.2f})")
+    return size
 
 # ================== [NEW v4] Signal Generation ============================
 def build_signal(name: str, epic: str) -> Optional[Dict]:
@@ -1208,9 +1253,9 @@ def build_signal(name: str, epic: str) -> Optional[Dict]:
 
     # [NEW v4] Adjust TP to nearest S/R level
     sr_levels = find_sr_levels(d1h, lookback=SR_LOOKBACK, min_touches=SR_MIN_TOUCHES, zone_pct=SR_ZONE_PCT)
-    tp        = adjust_tp_to_sr(tp_raw, entry, sig, sr_levels, atr_v)
+    tp        = adjust_tp_to_sr(tp_raw, tp_p, entry, sig, sr_levels, atr_v)
 
-    lot_size = calculate_position_size(entry, sl)
+    lot_size = calculate_position_size(name, entry, sl)
     if lot_size <= 0:
         return None
 
