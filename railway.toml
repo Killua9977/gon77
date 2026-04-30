@@ -1,2 +1,2 @@
 [deploy]
-startCommand = "python trading_bot_v4.py"
+startCommand = "python bot_main.py"
