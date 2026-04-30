@@ -48,7 +48,7 @@ PAIR_COOLDOWN_SECONDS      = int  (os.getenv("PAIR_COOLDOWN_SECONDS",     "14400
 MAX_AUTH_RETRIES           = int  (os.getenv("MAX_AUTH_RETRIES",          "5"))
 
 # v2/v3 features
-MIN_CONFLUENCE_SCORE       = int  (os.getenv("MIN_CONFLUENCE_SCORE",      "3"))  # relaxed from 4
+MIN_CONFLUENCE_SCORE       = int  (os.getenv("MIN_CONFLUENCE_SCORE",      "4"))
 DAILY_LOSS_LIMIT_PCT       = float(os.getenv("DAILY_LOSS_LIMIT_PCT",      "4.0"))
 NEWS_BUFFER_MINUTES        = int  (os.getenv("NEWS_BUFFER_MINUTES",       "30"))
 ADX_TREND_THRESHOLD        = float(os.getenv("ADX_TREND_THRESHOLD",       "20.0"))
@@ -56,14 +56,14 @@ MAX_PORTFOLIO_HEAT_PCT     = float(os.getenv("MAX_PORTFOLIO_HEAT_PCT",    "6.0")
 MIN_TRADES_FOR_DISABLE     = int  (os.getenv("MIN_TRADES_FOR_DISABLE",    "20"))
 DISABLE_WIN_RATE_THRESHOLD = float(os.getenv("DISABLE_WIN_RATE_THRESHOLD","35.0"))
 ML_MIN_TRADES_TO_TRAIN     = int  (os.getenv("ML_MIN_TRADES_TO_TRAIN",    "50"))
-ML_CONFIDENCE_THRESHOLD    = float(os.getenv("ML_CONFIDENCE_THRESHOLD",   "0.52"))  # relaxed from 0.60
+ML_CONFIDENCE_THRESHOLD    = float(os.getenv("ML_CONFIDENCE_THRESHOLD",   "0.60"))
 
 # v4 NEW
 STALE_TRADE_HOURS          = float(os.getenv("STALE_TRADE_HOURS",         "4.0"))   # close if no progress after N hours
 SR_LOOKBACK                = int  (os.getenv("SR_LOOKBACK",               "100"))   # candles for S/R detection
 SR_MIN_TOUCHES             = int  (os.getenv("SR_MIN_TOUCHES",            "2"))     # min touches to confirm S/R level
 SR_ZONE_PCT                = float(os.getenv("SR_ZONE_PCT",               "0.002")) # S/R zone width (0.2% of price)
-REQUIRE_ENGULFING          = os.getenv("REQUIRE_ENGULFING", "false").lower() == "true"  # relaxed: too rare on 15m
+REQUIRE_ENGULFING          = os.getenv("REQUIRE_ENGULFING", "true").lower() == "true"
 
 # Timing
 SCAN_INTERVAL_SECONDS        = int(os.getenv("SCAN_INTERVAL_SECONDS",       "900"))
@@ -85,40 +85,37 @@ ML_MODEL_FILE = "ml_model.pkl"
 INSTRUMENT_PROFILES = {
     # ── Forex majors ────────────────────────────────────────────────────────
     "FOREX": {
-        # Tuned specifically for EURUSD, GBPUSD, USDJPY, GBPJPY
         "pairs": {"EURUSD","GBPUSD","USDJPY","USDCHF","AUDUSD","USDCAD","NZDUSD","EURGBP","EURJPY","GBPJPY"},
-        "atr_stop":         1.5,    # tight stop — forex moves are precise
-        "atr_tp_full":      2.5,    # slightly bigger target
-        "atr_tp_partial":   1.4,    # partial TP earlier
-        "trailing_mult":    1.1,    # tight trail to lock profit fast
-        "spread_ratio":     0.25,
-        "rsi_buy_lo":       48, "rsi_buy_hi":  75,
-        "rsi_sell_lo":      25, "rsi_sell_hi": 52,
-        "adx_min":          18.0,
-        "trend_gap_mult":   0.20,
-        "session_start":    6,    # London pre-open + London + NY
-        "session_end":      18,
+        "atr_stop":         1.5,
+        "atr_tp_full":      2.4,
+        "atr_tp_partial":   1.5,
+        "trailing_mult":    1.2,
+        "spread_ratio":     0.20,
+        "rsi_buy_lo":       50, "rsi_buy_hi":  72,
+        "rsi_sell_lo":      28, "rsi_sell_hi": 50,
+        "adx_min":          20.0,
+        "trend_gap_mult":   0.25,
+        "session_start":    7,   # London open
+        "session_end":      17,  # NY close
         "decimals":         5,
         "min_dist":         0.00010,
     },
     # ── US Indices ───────────────────────────────────────────────────────────
     "INDEX": {
-        # Tuned specifically for US500
-        # US500 trends strongly during NY session, needs wider stops
         "pairs": {"US500","US30","USTEC"},
-        "atr_stop":         2.2,    # wider stop — indices spike before trending
-        "atr_tp_full":      3.5,    # bigger target — indices move far when trending
-        "atr_tp_partial":   2.0,    # partial TP at 2R
-        "trailing_mult":    1.8,    # wider trail — give room to breathe
-        "spread_ratio":     0.35,
-        "rsi_buy_lo":       50, "rsi_buy_hi":  75,
-        "rsi_sell_lo":      25, "rsi_sell_hi": 50,
-        "adx_min":          18.0,
-        "trend_gap_mult":   0.20,
-        "session_start":    13,    # NY open — US500 needs US session volume
-        "session_end":      21,    # NY close + afterhours
+        "atr_stop":         2.0,   # wider stop — indices are more volatile
+        "atr_tp_full":      3.0,   # bigger target
+        "atr_tp_partial":   1.8,
+        "trailing_mult":    1.5,
+        "spread_ratio":     0.30,  # allow wider spread
+        "rsi_buy_lo":       52, "rsi_buy_hi":  70,
+        "rsi_sell_lo":      30, "rsi_sell_hi": 48,
+        "adx_min":          22.0,
+        "trend_gap_mult":   0.30,
+        "session_start":    13,  # NY open only — indices need NY session
+        "session_end":      20,
         "decimals":         1,
-        "min_dist":         3.0,   # reduced from 5 — allows tighter entries
+        "min_dist":         5.0,
     },
     # ── Commodities (Gold, Silver, Oil) ─────────────────────────────────────
     "COMMODITY": {
@@ -127,13 +124,13 @@ INSTRUMENT_PROFILES = {
         "atr_tp_full":      2.8,
         "atr_tp_partial":   1.6,
         "trailing_mult":    1.4,
-        "spread_ratio":     0.30,  # relaxed
-        "rsi_buy_lo":       48, "rsi_buy_hi":  75,  # relaxed
-        "rsi_sell_lo":      25, "rsi_sell_hi": 52,  # relaxed
-        "adx_min":          20.0,  # relaxed from 25
-        "trend_gap_mult":   0.25,  # relaxed from 0.35
-        "session_start":    7,     # relaxed from 8
-        "session_end":      18,    # relaxed from 17
+        "spread_ratio":     0.25,
+        "rsi_buy_lo":       50, "rsi_buy_hi":  70,
+        "rsi_sell_lo":      30, "rsi_sell_hi": 50,
+        "adx_min":          25.0,  # higher ADX needed — commodities trend strongly or not at all
+        "trend_gap_mult":   0.35,
+        "session_start":    8,
+        "session_end":      17,
         "decimals":         2,
         "min_dist":         0.50,
     },
@@ -151,22 +148,20 @@ def get_decimals(pair: str) -> Tuple[int, float]:
 
 # Instrument universe
 pairs = {
-    # ── Forex majors (clean trends, low spread, 24h) ──────────────────────
-    "EURUSD": "EURUSD",   # most liquid, cleanest trends
-    "GBPUSD": "GBPUSD",   # strong directional moves
-    "USDJPY": "USDJPY",   # excellent momentum pair
-    "GBPJPY": "GBPJPY",   # high volatility, big moves
-    # ── Index (best trending index, NY session) ───────────────────────────
-    "US500":  "US 500",   # most predictable index, trends beautifully
+    "EURUSD": "EURUSD", "GBPUSD": "GBPUSD", "USDJPY": "USDJPY",
+    "USDCHF": "USDCHF", "AUDUSD": "AUDUSD", "USDCAD": "USDCAD",
+    "NZDUSD": "NZDUSD", "EURGBP": "EURGBP", "EURJPY": "EURJPY",
+    "GBPJPY": "GBPJPY",
+    "XAUUSD": "Gold",   "XAGUSD": "Silver",  "USOIL": "Oil - US Crude",
+    "US500":  "US 500", "US30":   "Wall Street", "USTEC": "US Tech 100",
 }
 
 CORRELATION_GROUPS = [
-    # GBPUSD and EURUSD are correlated — both USD negative
-    {"EURUSD", "GBPUSD"},
-    # USDJPY and GBPJPY both involve JPY
-    {"USDJPY", "GBPJPY"},
-    # Indices group (in case more added later)
+    {"EURUSD", "GBPUSD", "AUDUSD", "NZDUSD"},
+    {"USDJPY", "USDCHF", "USDCAD"},
+    {"EURJPY", "GBPJPY"},
     {"US500", "US30", "USTEC"},
+    {"XAUUSD", "XAGUSD"},
 ]
 
 # ================== Logging ================================================
@@ -376,12 +371,6 @@ class CapitalClient:
             r = fn[method](url, **kwargs)
             if r.status_code in [401, 403]:
                 self.authenticate()
-                return self._req(method, endpoint, data)
-            if r.status_code == 429:
-                # Rate limited — wait and retry once
-                wait = int(r.headers.get("Retry-After", 10))
-                logger.warning(f"Rate limited (429) — waiting {wait}s...")
-                time.sleep(wait)
                 return self._req(method, endpoint, data)
             if r.status_code != 200:
                 logger.error(f"API {r.status_code}: {r.text[:300]}")
@@ -927,15 +916,10 @@ def calculate_position_size(entry: float, sl: float) -> float:
 def build_signal(name: str, epic: str) -> Optional[Dict]:
     profile = get_profile(name)
 
-    # Rate limit protection — space out API calls (avoid 429 errors)
     d15  = broker.get_candles(epic, "MINUTE_15", 300)
-    time.sleep(0.5)
     d1h  = broker.get_candles(epic, "HOUR",      300)
-    time.sleep(0.5)
     d4h  = broker.get_candles(epic, "HOUR_4",    200)
-    time.sleep(0.5)
     live = broker.get_live_price(epic)
-    time.sleep(0.3)
 
     if any(x is None for x in [d15, d1h, d4h, live]):
         return None
@@ -1223,7 +1207,6 @@ def scan_pairs():
         if not epic:
             continue
 
-        time.sleep(0.5)  # Rate limit: pause between each pair
         signal = build_signal(name, epic)
         if not signal:
             continue
@@ -1246,7 +1229,6 @@ def check_open_trades():
         live = broker.get_live_price(trade["epic"])
         if live:
             update_trade_status(trade, live)
-        time.sleep(0.3)  # Rate limit: space out live price checks
 
 def send_heartbeat():
     equity  = broker.get_account_balance()
@@ -1293,12 +1275,11 @@ def main():
     last_report   = 0
     last_ml_train = time.time()
 
-    pair_list = ", ".join(pairs.keys())
     send_telegram(
-        f"🚀 Bot v4.1 Started — Optimized 5-Pair Setup\n"
-        f"Pairs: {pair_list}\n"
-        f"Score: {MIN_CONFLUENCE_SCORE}/6 | Stale exit: {STALE_TRADE_HOURS}h\n"
-        f"Heat limit: {MAX_PORTFOLIO_HEAT_PCT}% | Daily loss: {DAILY_LOSS_LIMIT_PCT}%\n"
+        f"🚀 Bot v4 Started — Win Rate Optimized\n"
+        f"Pairs: {len(pairs)} | Score: {MIN_CONFLUENCE_SCORE}/6\n"
+        f"Engulfing filter: {REQUIRE_ENGULFING} | S/R TP: ON\n"
+        f"Stale exit: {STALE_TRADE_HOURS}h | Session: per-instrument\n"
         f"ML: {'Active' if ml_filter.trained else 'Collecting data...'}"
     )
 
