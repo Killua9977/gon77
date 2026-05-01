@@ -1,2 +1,2 @@
 [deploy]
-startCommand = "python fx_engine.py"
+startCommand = "python alpha_trader.py"
