@@ -1,2 +1,2 @@
 [deploy]
-startCommand = "python bot_main.py"
+startCommand = "python killua_bot.py"
