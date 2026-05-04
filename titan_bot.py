@@ -599,7 +599,20 @@ class CapitalClient:
 
         level = data.get("level", "?")
         stop  = data.get("stopLevel", "?")
-        logger.info(f"✅ Fill confirmed: {deal_ref} | Entry={level} SL={stop} | TP=bot-managed")
+
+        # Extract the opened dealId from affectedDeals for faster position closing
+        opened_deal_id = None
+        for d in data.get("affectedDeals", []):
+            if d.get("status") == "OPENED":
+                opened_deal_id = d.get("dealId")
+                break
+
+        if opened_deal_id:
+            data["opened_deal_id"] = opened_deal_id
+            logger.info(f"✅ Fill confirmed: ref={deal_ref} dealId={opened_deal_id} Entry={level} SL={stop} | TP=bot-managed")
+        else:
+            logger.info(f"✅ Fill confirmed: ref={deal_ref} Entry={level} SL={stop} | TP=bot-managed")
+
         return data
 
 
@@ -610,7 +623,49 @@ class CapitalClient:
         return 0.0
 
     def close_position(self, deal_ref: str) -> bool:
-        return self._req("DELETE", f"/api/v1/positions/{deal_ref}") is not None
+        """
+        ROOT CAUSE FIX: Capital.com DELETE endpoint needs dealId not dealReference.
+        dealReference = order reference (what we store when placing order)
+        dealId = actual open position ID (what Capital.com needs to close)
+        These are DIFFERENT values — using wrong one causes silent failure.
+        """
+        try:
+            # Step 1: find the dealId for this dealReference
+            positions = self._req("GET", "/api/v1/positions")
+            if not positions:
+                logger.error(f"Cannot fetch positions to close {deal_ref}")
+                return False
+
+            deal_id = None
+            for pos in positions.get("positions", []):
+                pos_data = pos.get("position", {})
+                # Check both dealReference and dealId
+                if (pos_data.get("dealReference") == deal_ref or
+                    pos_data.get("dealId") == deal_ref):
+                    # Get the dealId from affectedDeals if available
+                    deal_id = pos_data.get("dealId", "")
+                    logger.info(f"Found position to close: dealRef={deal_ref} dealId={deal_id}")
+                    break
+
+            if not deal_id:
+                logger.warning(f"Position not found for {deal_ref} — may already be closed")
+                return True  # treat as success if position not found
+
+            # Step 2: close using dealId
+            logger.info(f"Closing position: DELETE /positions/{deal_id}")
+            result = self._req("DELETE", f"/api/v1/positions/{deal_id}")
+            logger.info(f"Close result: {result}")
+
+            if result is not None:
+                logger.info(f"✅ Position closed: {deal_id}")
+                return True
+            else:
+                logger.error(f"❌ Failed to close position: {deal_id}")
+                return False
+
+        except Exception as e:
+            logger.error(f"close_position error: {e}")
+            return False
 
 # ================== Helpers ===============================================
 def ensure_csv(path: str, headers: List[str]):
@@ -1242,6 +1297,11 @@ def open_trade(signal: Dict):
         "instrument_class": signal["instrument_class"],
     }
 
+    # Store the actual dealId (not dealReference) for reliable position closing
+    if fill and fill.get("opened_deal_id"):
+        trade["deal_id"] = fill["opened_deal_id"]
+        logger.info(f"Stored dealId for closing: {trade['deal_id']}")
+
     db_id          = db_save_trade(trade)
     trade["db_id"] = db_id
     trades.append(trade)
@@ -1282,11 +1342,11 @@ def update_trade_status(trade: Dict, live: Dict):
     # ── Full TP — bot closes position directly on broker ─────────────────────
     if trade["type"] == "BUY" and price >= trade["tp"]:
         logger.info(f"TP2 hit: {trade['pair']} @ {price} (TP={trade['tp']})")
-        broker.close_position(trade["deal_ref"])
+        broker.close_position(trade.get("deal_id", trade["deal_ref"]))
         close_trade("WIN", price, "TP2"); return
     if trade["type"] == "SELL" and price <= trade["tp"]:
         logger.info(f"TP2 hit: {trade['pair']} @ {price} (TP={trade['tp']})")
-        broker.close_position(trade["deal_ref"])
+        broker.close_position(trade.get("deal_id", trade["deal_ref"]))
         close_trade("WIN", price, "TP2"); return
 
     # ── Partial TP (bot-managed) ─────────────────────────────────────────────
@@ -1299,7 +1359,7 @@ def update_trade_status(trade: Dict, live: Dict):
                 logger.info(f"Bot-managed TP1 hit: {trade['pair']} @ {price} (TP1={tp_p})")
                 half = round(trade["lot_size"] / 2, 2)
                 if half > 0:
-                    closed = broker.close_position(trade["deal_ref"])
+                    closed = broker.close_position(trade.get("deal_id", trade["deal_ref"]))
                     if closed:
                         trade["partial_done"] = True
                         trade["lot_size"]     = half
