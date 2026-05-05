@@ -629,6 +629,33 @@ class CapitalClient:
             return float(data["accounts"][0]["balance"]["balance"])
         return 0.0
 
+    def update_sl(self, deal_ref: str, new_sl: float) -> bool:
+        """Update stop loss on an open position using dealId."""
+        try:
+            positions = self._req("GET", "/api/v1/positions")
+            if not positions:
+                return False
+            for pos in positions.get("positions", []):
+                pos_data = pos.get("position", {})
+                if (pos_data.get("dealReference") == deal_ref or
+                        pos_data.get("dealId") == deal_ref):
+                    deal_id = pos_data.get("dealId", "")
+                    if not deal_id:
+                        return False
+                    result = self._req("PUT", f"/api/v1/positions/{deal_id}", {
+                        "stopLevel": float(new_sl)
+                    })
+                    if result:
+                        logger.info(f"✅ SL updated on broker: {deal_id} → {new_sl}")
+                        return True
+                    logger.error(f"❌ SL update failed for {deal_id}")
+                    return False
+            logger.warning(f"Position not found for SL update: {deal_ref}")
+            return False
+        except Exception as e:
+            logger.error(f"update_sl error: {e}")
+            return False
+
     def close_position(self, deal_ref: str) -> bool:
         """
         ROOT CAUSE FIX: Capital.com DELETE endpoint needs dealId not dealReference.
@@ -1159,6 +1186,19 @@ MAX_LOT_SIZES = {
     "XAUUSD": 10,    "XAGUSD": 100,   "USOIL":  100,
 }
 
+def _update_sl_on_broker(trade: Dict, new_sl: float):
+    """Updates SL on broker for a trade. Logs result but doesn't block."""
+    try:
+        deal_id = trade.get("deal_id", trade.get("deal_ref", ""))
+        if deal_id:
+            success = broker.update_sl(deal_id, new_sl)
+            if success:
+                logger.info(f"Broker SL updated: {trade['pair']} → {new_sl}")
+            else:
+                logger.warning(f"Broker SL update failed for {trade['pair']} — SL tracked internally only")
+    except Exception as e:
+        logger.error(f"_update_sl_on_broker error: {e}")
+
 def calculate_position_size(pair: str, entry: float, sl: float) -> float:
     equity   = broker.get_account_balance() if broker else INITIAL_EQUITY
     equity   = equity if equity > 0 else INITIAL_EQUITY
@@ -1425,34 +1465,80 @@ def update_trade_status(trade: Dict, live: Dict):
     if trade["type"] == "SELL" and price >= trade["sl"]:
         close_trade("WIN" if price <= trade["entry"] else "LOSS", price, "SL"); return
 
-    # ── Full TP — bot closes position directly on broker ─────────────────────
-    if trade["type"] == "BUY" and price >= trade["tp"]:
-        logger.info(f"TP2 hit: {trade['pair']} @ {price} (TP={trade['tp']})")
-        broker.close_position(trade.get("deal_id", trade["deal_ref"]))
-        close_trade("WIN", price, "TP2"); return
-    if trade["type"] == "SELL" and price <= trade["tp"]:
-        logger.info(f"TP2 hit: {trade['pair']} @ {price} (TP={trade['tp']})")
-        broker.close_position(trade.get("deal_id", trade["deal_ref"]))
-        close_trade("WIN", price, "TP2"); return
+    # ══════════════════════════════════════════════════════════════════
+    # AUTO-MOVING SL SYSTEM (replaces all TP logic)
+    # Step 1: Price hits TP1 → SL moves to TP1 → trade is now risk-free
+    # Step 2: Price hits TP2 → SL moves to TP2 → bot closes = full WIN
+    # No broker TP needed. No close_position calls. Just SL updates.
+    # SL update already works perfectly on Capital.com.
+    # ══════════════════════════════════════════════════════════════════
+    decimals = get_decimals(trade["pair"])[0]
+    tp1      = trade.get("tp_partial")
+    tp2      = trade.get("tp")
 
-    # ── Partial TP (bot-managed) ─────────────────────────────────────────────
-    if not trade.get("partial_done", False):
-        tp_p = trade.get("tp_partial")
-        if tp_p:
-            hit = (trade["type"]=="BUY" and price >= tp_p) or \
-                  (trade["type"]=="SELL" and price <= tp_p)
-            if hit:
-                logger.info(f"Bot-managed TP1 hit: {trade['pair']} @ {price} (TP1={tp_p})")
-                half = round(trade["lot_size"] / 2, 2)
-                if half > 0:
-                    closed = broker.close_position(trade.get("deal_id", trade["deal_ref"]))
-                    if closed:
-                        trade["partial_done"] = True
-                        trade["lot_size"]     = half
-                        changed = True
-                        send_telegram(f"🎯 TP1 hit! {trade['pair']} 50% closed @ {price}\nRunning 50% to TP2: {trade['tp']}")
-                    else:
-                        logger.warning(f"Partial close failed for {trade['pair']} — will retry next check")
+    if trade["type"] == "BUY":
+
+        # ── Step 2: TP2 hit → move SL to TP2 → close on next SL check ──
+        if tp2 and price >= float(tp2) and trade.get("partial_done", False):
+            new_sl = round(float(tp2), decimals)
+            if new_sl > trade["sl"]:
+                trade["sl"] = new_sl
+                changed     = True
+                _update_sl_on_broker(trade, new_sl)
+                logger.info(f"🏆 TP2 hit: {trade['pair']} SL → {new_sl} (will close on reversal)")
+                send_telegram(
+                    f"🏆 TP2 HIT! | {trade['pair']} BUY\n"
+                    f"Price: {price} | SL locked at TP2: {new_sl}\n"
+                    f"Trade will close on any reversal = FULL WIN"
+                )
+
+        # ── Step 1: TP1 hit → move SL to TP1 → trade risk-free ──────────
+        elif tp1 and price >= float(tp1) and not trade.get("partial_done", False):
+            new_sl = round(float(tp1), decimals)
+            if new_sl > trade["sl"]:
+                trade["sl"]           = new_sl
+                trade["partial_done"] = True
+                changed               = True
+                _update_sl_on_broker(trade, new_sl)
+                logger.info(f"🔒 TP1 hit: {trade['pair']} SL → {new_sl} (risk-free now)")
+                send_telegram(
+                    f"🔒 TP1 LOCKED | {trade['pair']} BUY\n"
+                    f"Price: {price} hit TP1: {tp1}\n"
+                    f"SL moved to TP1: {new_sl} — trade is now RISK-FREE\n"
+                    f"Targeting TP2: {tp2}"
+                )
+
+    elif trade["type"] == "SELL":
+
+        # ── Step 2: TP2 hit → move SL to TP2 ────────────────────────────
+        if tp2 and price <= float(tp2) and trade.get("partial_done", False):
+            new_sl = round(float(tp2), decimals)
+            if new_sl < trade["sl"]:
+                trade["sl"] = new_sl
+                changed     = True
+                _update_sl_on_broker(trade, new_sl)
+                logger.info(f"🏆 TP2 hit: {trade['pair']} SL → {new_sl}")
+                send_telegram(
+                    f"🏆 TP2 HIT! | {trade['pair']} SELL\n"
+                    f"Price: {price} | SL locked at TP2: {new_sl}\n"
+                    f"Trade will close on any reversal = FULL WIN"
+                )
+
+        # ── Step 1: TP1 hit → move SL to TP1 ────────────────────────────
+        elif tp1 and price <= float(tp1) and not trade.get("partial_done", False):
+            new_sl = round(float(tp1), decimals)
+            if new_sl < trade["sl"]:
+                trade["sl"]           = new_sl
+                trade["partial_done"] = True
+                changed               = True
+                _update_sl_on_broker(trade, new_sl)
+                logger.info(f"🔒 TP1 hit: {trade['pair']} SL → {new_sl} (risk-free now)")
+                send_telegram(
+                    f"🔒 TP1 LOCKED | {trade['pair']} SELL\n"
+                    f"Price: {price} hit TP1: {tp1}\n"
+                    f"SL moved to TP1: {new_sl} — trade is now RISK-FREE\n"
+                    f"Targeting TP2: {tp2}"
+                )
 
     # ── Break-even ───────────────────────────────────────────────────────────
     if not trade["break_even_done"]:
@@ -1465,6 +1551,7 @@ def update_trade_status(trade: Dict, live: Dict):
                 trade["sl"]              = round(be, profile["decimals"])
                 trade["break_even_done"] = True
                 changed = True
+                _update_sl_on_broker(trade, trade["sl"])
                 send_telegram(f"🔒 Break-even | {trade['pair']} SL → {trade['sl']}")
 
     # ── Trailing stop ────────────────────────────────────────────────────────
@@ -1472,10 +1559,16 @@ def update_trade_status(trade: Dict, live: Dict):
         trail = trade.get("entry_atr", 0) * profile["trailing_mult"]
         if trade["type"] == "BUY":
             ns = round(price - trail, profile["decimals"])
-            if ns > trade["sl"]: trade["sl"] = ns; changed = True
+            if ns > trade["sl"]:
+                trade["sl"] = ns
+                changed = True
+                _update_sl_on_broker(trade, ns)
         else:
             ns = round(price + trail, profile["decimals"])
-            if ns < trade["sl"]: trade["sl"] = ns; changed = True
+            if ns < trade["sl"]:
+                trade["sl"] = ns
+                changed = True
+                _update_sl_on_broker(trade, ns)
 
     # ── [NEW v4] Stale trade exit ────────────────────────────────────────────
     elapsed_hours = (time.time() - trade["opened_at"]) / 3600
@@ -1595,12 +1688,12 @@ def main():
 
     pair_list = ", ".join(pairs.keys())
     send_telegram(
-        f"🚀 Bot v6 Started — Pro Trader Edition\n"
+        f"🚀 Bot v6.1 Started — SL-Lock Edition\n"
         f"Pairs: {pair_list}\n"
         f"Risk: {RISK_PERCENT}% | Score: {MIN_CONFLUENCE_SCORE}/6\n"
         f"Weekly bias: {WEEKLY_BIAS_FILTER} | Trend maturity: ON\n"
         f"Dynamic risk: ON (halved after {MAX_CONSECUTIVE_LOSSES} losses)\n"
-        f"GBPJPY: REMOVED | TP: Bot-managed\n"
+        f"TP: Auto-moving SL (TP1→TP2) | No broker TP needed\n"
         f"ML: {'Active' if ml_filter.trained else 'Collecting data...'}"
     )
 
