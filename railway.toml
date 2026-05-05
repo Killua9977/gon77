@@ -1,2 +1,2 @@
 [deploy]
-startCommand = "python titan_bot.py"
+startCommand = "python pro_bot.py"
