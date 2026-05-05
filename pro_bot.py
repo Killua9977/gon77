@@ -41,7 +41,7 @@ CAPITAL_LOGIN    = os.getenv("CAPITAL_LOGIN",       "").strip()
 CAPITAL_PASSWORD = os.getenv("CAPITAL_PASSWORD",    "").strip()
 
 INITIAL_EQUITY             = float(os.getenv("INITIAL_EQUITY",            "1000.0"))
-RISK_PERCENT               = float(os.getenv("RISK_PERCENT",              "2.0"))
+RISK_PERCENT               = float(os.getenv("RISK_PERCENT",              "1.0"))  # reduced from 2% — safer while testing
 MAX_ACTIVE_TRADES          = int  (os.getenv("MAX_ACTIVE_TRADES",         "10"))
 BREAK_EVEN_TRIGGER_R       = float(os.getenv("BREAK_EVEN_TRIGGER_R",      "1.0"))
 PAIR_COOLDOWN_SECONDS      = int  (os.getenv("PAIR_COOLDOWN_SECONDS",     "14400"))
@@ -59,7 +59,13 @@ ML_MIN_TRADES_TO_TRAIN     = int  (os.getenv("ML_MIN_TRADES_TO_TRAIN",    "50"))
 ML_CONFIDENCE_THRESHOLD    = float(os.getenv("ML_CONFIDENCE_THRESHOLD",   "0.52"))  # relaxed from 0.60
 
 # v4 NEW
-STALE_TRADE_HOURS          = float(os.getenv("STALE_TRADE_HOURS",         "4.0"))   # close if no progress after N hours
+STALE_TRADE_HOURS          = float(os.getenv("STALE_TRADE_HOURS",         "4.0"))
+
+# v5 NEW — Professional trading improvements
+MAX_CONSECUTIVE_LOSSES     = int  (os.getenv("MAX_CONSECUTIVE_LOSSES",    "2"))     # cut size after N losses
+DYNAMIC_RISK_REDUCTION     = float(os.getenv("DYNAMIC_RISK_REDUCTION",    "0.5"))   # multiply risk by this after losing streak
+TREND_MATURITY_BARS        = int  (os.getenv("TREND_MATURITY_BARS",       "20"))    # max bars EMA gap has been widening
+WEEKLY_BIAS_FILTER         = os.getenv("WEEKLY_BIAS_FILTER", "true").lower() == "true"   # close if no progress after N hours
 SR_LOOKBACK                = int  (os.getenv("SR_LOOKBACK",               "100"))   # candles for S/R detection
 SR_MIN_TOUCHES             = int  (os.getenv("SR_MIN_TOUCHES",            "2"))     # min touches to confirm S/R level
 SR_ZONE_PCT                = float(os.getenv("SR_ZONE_PCT",               "0.002")) # S/R zone width (0.2% of price)
@@ -169,13 +175,14 @@ def get_decimals(pair: str) -> Tuple[int, float]:
 
 # Instrument universe
 pairs = {
-    # ── Forex majors (clean trends, low spread, 24h) ──────────────────────
+    # ── Core forex — clean trends, manageable volatility ──────────────────
     "EURUSD": "EURUSD",   # most liquid, cleanest trends
     "GBPUSD": "GBPUSD",   # strong directional moves
     "USDJPY": "USDJPY",   # excellent momentum pair
-    "GBPJPY": "GBPJPY",   # high volatility, big moves
-    # ── Index (best trending index, NY session) ───────────────────────────
-    "US500":  "US 500",   # most predictable index, trends beautifully
+    # ── Index — NY session only ───────────────────────────────────────────
+    "US500":  "US 500",   # most predictable index
+    # GBPJPY removed — too volatile, requires special handling, causing big losses
+    # Re-enable after 100+ trades of data: "GBPJPY": "GBPJPY"
 }
 
 CORRELATION_GROUPS = [
@@ -695,6 +702,50 @@ def send_telegram(msg: str):
     except Exception as e:
         logger.error(f"Telegram: {e}")
 
+# ================== [NEW v5] Weekly Bias Filter ===========================
+def get_weekly_bias(epic: str) -> Optional[str]:
+    """
+    Gets the weekly trend direction by checking if price is above/below
+    the weekly EMA20. Only take BUY signals in uptrend, SELL in downtrend.
+    This prevents trading against the major trend.
+    """
+    if not WEEKLY_BIAS_FILTER:
+        return None  # disabled
+    try:
+        data = broker.get_candles(epic, "WEEK", 30)
+        if data is None or len(data) < 10:
+            return None
+        close  = data["Close"]
+        ema20w = close.ewm(span=20, adjust=False).mean()
+        last   = float(close.iloc[-1])
+        e20    = float(ema20w.iloc[-1])
+        bias   = "BUY" if last > e20 else "SELL"
+        logger.info(f"Weekly bias: {epic} price={last:.5f} EMA20={e20:.5f} → {bias}")
+        return bias
+    except Exception as e:
+        logger.warning(f"Weekly bias error for {epic}: {e}")
+        return None  # if fails, don't block trade
+
+# ================== [NEW v5] Trend Maturity Check ==========================
+def is_trend_mature(ema20: pd.Series, ema50: pd.Series, direction: str,
+                    lookback: int = 20) -> bool:
+    """
+    Returns True if the EMA gap has been widening for too long — meaning
+    the trend is mature/exhausted and we are likely entering too late.
+    A professional only enters early in a trend, not after it has run far.
+    """
+    if len(ema20) < lookback:
+        return False
+    recent_e20 = ema20.iloc[-lookback:]
+    recent_e50 = ema50.iloc[-lookback:]
+    gaps = (recent_e20 - recent_e50).abs()
+    # Check if gap has been consistently widening (trend mature)
+    widening_count = sum(1 for i in range(1, len(gaps)) if gaps.iloc[i] > gaps.iloc[i-1])
+    mature = widening_count > lookback * 0.75  # widening 75%+ of lookback = mature
+    if mature:
+        logger.info(f"Trend mature: gap widening {widening_count}/{lookback} bars — late entry risk")
+    return mature
+
 # ================== Indicators ============================================
 def calc_rsi(series: pd.Series, period: int = 14) -> pd.Series:
     d    = series.diff()
@@ -1023,10 +1074,11 @@ class PairPerformanceManager:
         return "\n".join(lines) if lines else "No pair data yet."
 
 # ================== Global State ==========================================
-trades:           List[Dict]       = []
-wins = losses                      = 0
-last_trade_times: Dict[str, float] = {}
-broker:           Optional[CapitalClient] = None
+trades:              List[Dict]       = []
+wins = losses                         = 0
+consecutive_losses: int               = 0  # v5: track losing streak
+last_trade_times:   Dict[str, float]  = {}
+broker:             Optional[CapitalClient] = None
 ml_filter    = MLSignalFilter()
 corr_filter  = CorrelationFilter()
 heat_monitor = PortfolioHeatMonitor()
@@ -1110,7 +1162,14 @@ MAX_LOT_SIZES = {
 def calculate_position_size(pair: str, entry: float, sl: float) -> float:
     equity   = broker.get_account_balance() if broker else INITIAL_EQUITY
     equity   = equity if equity > 0 else INITIAL_EQUITY
-    risk_amt = equity * (RISK_PERCENT / 100)
+
+    # v5: Dynamic risk — reduce after losing streak
+    effective_risk = RISK_PERCENT
+    if consecutive_losses >= MAX_CONSECUTIVE_LOSSES:
+        effective_risk = RISK_PERCENT * DYNAMIC_RISK_REDUCTION
+        logger.info(f"Dynamic risk: {RISK_PERCENT}% → {effective_risk}% (streak={consecutive_losses})")
+
+    risk_amt = equity * (effective_risk / 100)
     sl_dist  = abs(entry - sl)
     if sl_dist <= 0:
         return 0
@@ -1118,9 +1177,9 @@ def calculate_position_size(pair: str, entry: float, sl: float) -> float:
     # Enforce min/max lot sizes
     min_lot = MIN_LOT_SIZES.get(pair, 1000)
     max_lot = MAX_LOT_SIZES.get(pair, 50000)
-    size    = max(size, min_lot)   # at least minimum
-    size    = min(size, max_lot)   # never exceed maximum
-    logger.info(f"{pair} position size: {size} (min={min_lot} max={max_lot} risk={risk_amt:.2f})")
+    size    = max(size, min_lot)
+    size    = min(size, max_lot)
+    logger.info(f"{pair} size={size} risk={effective_risk}% equity={equity:.2f} streak={consecutive_losses}")
     return size
 
 # ================== [NEW v4] Signal Generation ============================
@@ -1207,6 +1266,18 @@ def build_signal(name: str, epic: str) -> Optional[Dict]:
     if sig == "BUY"  and pdi_v <= mdi_v: return None
     if sig == "SELL" and mdi_v <= pdi_v: return None
 
+    # [NEW v5] Weekly bias filter — don't trade against major trend
+    time.sleep(0.3)
+    weekly_bias = get_weekly_bias(epic)
+    if weekly_bias and weekly_bias != sig:
+        logger.info(f"{name}: weekly bias={weekly_bias} conflicts with signal={sig} — skip")
+        return None
+
+    # [NEW v5] Trend maturity check — don't enter exhausted trends
+    if is_trend_mature(ema20_15m, ema50_15m, sig, lookback=TREND_MATURITY_BARS):
+        logger.info(f"{name}: trend too mature — late entry risk — skip")
+        return None
+
     # [NEW v4] Candlestick confirmation
     if not has_confirmation_candle(d15, sig):
         logger.info(f"{name}: no engulfing candle confirmation — skip")
@@ -1278,12 +1349,27 @@ def open_trade(signal: Dict):
         signal["entry"], signal["sl"], signal["tp"]
     )
     if not order_id:
+        logger.error(f"Order placement failed for {signal['pair']}")
         return
 
+    # v5 FIX: Send Telegram IMMEDIATELY after order placed
+    # Previous bug: Telegram was sent at end of function — if confirm_fill
+    # failed early, Telegram was never sent even though trade opened on broker
+    eff_risk = RISK_PERCENT * (DYNAMIC_RISK_REDUCTION if consecutive_losses >= MAX_CONSECUTIVE_LOSSES else 1.0)
+    send_telegram(
+        f"🔔 NEW TRADE | {signal['pair']} {signal['type']} [{signal['instrument_class']}]\n"
+        f"Entry: {signal['entry']} | SL: {signal['sl']}\n"
+        f"TP1: {signal['tp_partial']} | TP2: {signal['tp']}\n"
+        f"Score: {signal['confluence_score']}/6 | ML: {signal['ml_confidence']:.0%} | ADX: {signal['adx']}\n"
+        f"Risk: {eff_risk:.1f}% | Streak: {consecutive_losses}L"
+    )
+
     time.sleep(1)
-    if not broker.confirm_fill(order_id):
-        send_telegram(f"⚠️ Unconfirmed fill: {signal['pair']} ref={order_id}")
-        return
+    fill = broker.confirm_fill(order_id)
+    if not fill:
+        logger.warning(f"Fill unconfirmed for {signal['pair']} ref={order_id} — trade may still be open on broker")
+        send_telegram(f"⚠️ Fill unconfirmed: {signal['pair']} ref={order_id}\nCheck Capital.com manually")
+        fill = {"status": "OPEN", "level": signal["entry"]}
 
     trade = {
         "pair": signal["pair"], "epic": signal["epic"], "type": signal["type"],
@@ -1509,11 +1595,12 @@ def main():
 
     pair_list = ", ".join(pairs.keys())
     send_telegram(
-        f"🚀 Bot v5 Started — TP Bot-Managed\n"
+        f"🚀 Bot v6 Started — Pro Trader Edition\n"
         f"Pairs: {pair_list}\n"
-        f"Score: {MIN_CONFLUENCE_SCORE}/6 | Stale exit: {STALE_TRADE_HOURS}h\n"
-        f"Heat: {MAX_PORTFOLIO_HEAT_PCT}% | Daily loss: {DAILY_LOSS_LIMIT_PCT}%\n"
-        f"TP: Bot-managed (no broker TP) | SL: Broker\n"
+        f"Risk: {RISK_PERCENT}% | Score: {MIN_CONFLUENCE_SCORE}/6\n"
+        f"Weekly bias: {WEEKLY_BIAS_FILTER} | Trend maturity: ON\n"
+        f"Dynamic risk: ON (halved after {MAX_CONSECUTIVE_LOSSES} losses)\n"
+        f"GBPJPY: REMOVED | TP: Bot-managed\n"
         f"ML: {'Active' if ml_filter.trained else 'Collecting data...'}"
     )
 
