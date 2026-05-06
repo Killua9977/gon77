@@ -1,2 +1,2 @@
 [deploy]
-startCommand = "python vortex_bot.py"
+startCommand = "python storm_bot.py"
