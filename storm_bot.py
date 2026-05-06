@@ -64,8 +64,8 @@ STALE_TRADE_HOURS          = float(os.getenv("STALE_TRADE_HOURS",         "4.0")
 # v5 NEW — Professional trading improvements
 MAX_CONSECUTIVE_LOSSES     = int  (os.getenv("MAX_CONSECUTIVE_LOSSES",    "2"))     # cut size after N losses
 DYNAMIC_RISK_REDUCTION     = float(os.getenv("DYNAMIC_RISK_REDUCTION",    "0.5"))   # multiply risk by this after losing streak
-TREND_MATURITY_BARS        = int  (os.getenv("TREND_MATURITY_BARS",       "20"))    # max bars EMA gap has been widening
-WEEKLY_BIAS_FILTER         = os.getenv("WEEKLY_BIAS_FILTER", "true").lower() == "true"   # close if no progress after N hours
+TREND_MATURITY_BARS        = int  (os.getenv("TREND_MATURITY_BARS",       "40"))    # relaxed from 20 — was blocking too many trades
+WEEKLY_BIAS_FILTER         = os.getenv("WEEKLY_BIAS_FILTER", "false").lower() == "true"  # disabled by default — too strict
 SR_LOOKBACK                = int  (os.getenv("SR_LOOKBACK",               "100"))   # candles for S/R detection
 SR_MIN_TOUCHES             = int  (os.getenv("SR_MIN_TOUCHES",            "2"))     # min touches to confirm S/R level
 SR_ZONE_PCT                = float(os.getenv("SR_ZONE_PCT",               "0.002")) # S/R zone width (0.2% of price)
@@ -768,7 +768,7 @@ def is_trend_mature(ema20: pd.Series, ema50: pd.Series, direction: str,
     gaps = (recent_e20 - recent_e50).abs()
     # Check if gap has been consistently widening (trend mature)
     widening_count = sum(1 for i in range(1, len(gaps)) if gaps.iloc[i] > gaps.iloc[i-1])
-    mature = widening_count > lookback * 0.75  # widening 75%+ of lookback = mature
+    mature = widening_count > lookback * 0.85  # widening 85%+ of lookback = mature (relaxed from 75%)
     if mature:
         logger.info(f"Trend mature: gap widening {widening_count}/{lookback} bars — late entry risk")
     return mature
@@ -1691,7 +1691,7 @@ def main():
         f"🚀 Bot v6.1 Started — SL-Lock Edition\n"
         f"Pairs: {pair_list}\n"
         f"Risk: {RISK_PERCENT}% | Score: {MIN_CONFLUENCE_SCORE}/6\n"
-        f"Weekly bias: {WEEKLY_BIAS_FILTER} | Trend maturity: ON\n"
+        f"Weekly bias: OFF | Trend maturity: relaxed (40 bars)\n"
         f"Dynamic risk: ON (halved after {MAX_CONSECUTIVE_LOSSES} losses)\n"
         f"TP: Auto-moving SL (TP1→TP2) | No broker TP needed\n"
         f"ML: {'Active' if ml_filter.trained else 'Collecting data...'}"
