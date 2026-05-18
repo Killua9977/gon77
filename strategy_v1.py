@@ -1003,8 +1003,35 @@ def update_sl_broker(trade: Dict, new_sl: float):
         return
     decimals   = PAIRS[trade["pair"]]["decimals"]
     identifier = trade.get("deal_id") or trade.get("deal_ref","")
+    epic_fb    = epics.get(trade.get("pair",""), "")
+
+    # Try with stored identifier first
     if identifier:
-        broker.update_sl(identifier, new_sl, decimals)
+        success = broker.update_sl(identifier, new_sl, decimals)
+        if success:
+            return
+
+    # Fallback: resolve by epic and update
+    if epic_fb:
+        logger.warning(
+            "%s: SL update by identifier failed — trying epic fallback",
+            trade.get("pair","")
+        )
+        pos = broker._resolve("", epic_fb)
+        if pos and pos.get("dealId"):
+            # Store the correct dealId for future operations
+            trade["deal_id"] = pos["dealId"]
+            db_update_trade(trade)
+            result = broker._req("PUT",
+                f"/api/v1/positions/{pos['dealId']}",
+                {"stopLevel": float(round(new_sl, decimals))}
+            )
+            if result:
+                logger.info("%s SL updated via epic fallback → %.5f",
+                            trade.get("pair",""), new_sl)
+            else:
+                logger.error("%s SL update failed completely",
+                             trade.get("pair",""))
 
 def check_trades(live_prices: Dict[str, Dict]):
     """
@@ -1044,12 +1071,25 @@ def check_trades(live_prices: Dict[str, Dict]):
             tp1_hit = ((trade["direction"]=="BUY"  and price >= trade["tp1"])
                     or (trade["direction"]=="SELL" and price <= trade["tp1"]))
             if tp1_hit:
+                # Internal SL = exact TP1 level (for bot tracking)
                 new_sl = round(trade["tp1"], decimals)
                 trade["sl"]         = new_sl
                 trade["tp1_locked"] = True
                 db_update_trade(trade)
-                update_sl_broker(trade, new_sl)
-                logger.info("%s TP1 locked: SL → %.5f", pair, new_sl)
+
+                # Broker SL = TP1 minus small buffer to avoid
+                # "error.invalid.stoploss.maxvalue" rejection
+                # Capital.com requires SL to be a few pips below current price
+                pip = 0.0001 if pair != "USDJPY" else 0.01
+                if pair == "US500": pip = 1.0
+                broker_sl = round(
+                    new_sl - pip * 3 if trade["direction"]=="BUY"
+                    else new_sl + pip * 3,
+                    decimals
+                )
+                update_sl_broker(trade, broker_sl)
+                logger.info("%s TP1 locked: SL → %.5f (broker=%.5f)",
+                            pair, new_sl, broker_sl)
                 send_telegram(
                     f"🔒 TP1 LOCKED | {pair} {trade['direction']}\n"
                     f"Price: {round(price,decimals)} hit TP1: "
