@@ -655,6 +655,19 @@ def calculate_trade_pnl(pair: str, direction: str,
             else (entry - exit_price))
     return round(move * lot_size * get_point_value(pair), 2)
 
+
+def make_disabled_range(high: float, low: float, size: float,
+                        bias: str = "", reason: str = "") -> Dict:
+    """Range exists, but the bot should not trade it again today."""
+    return {
+        "high": high,
+        "low": low,
+        "size": size,
+        "bias": bias,
+        "disabled": True,
+        "skip_reason": reason,
+    }
+
 # ================== Strategy 1: ORB (US500) ================================
 class ORBStrategy:
     """
@@ -696,13 +709,13 @@ class ORBStrategy:
 
         if size < ORB_MIN_RANGE:
             logger.info("US500: range too small %.2f", size)
-            send_telegram(f"⚠️ US500 range too small: {size:.2f}pts — no trade today")
-            return None
+            send_telegram(f"?? US500 range too small: {size:.2f}pts ? no trade today")
+            return make_disabled_range(high, low, size, reason="too_small")
 
         if size > ORB_MAX_RANGE:
             logger.info("US500: range too large %.2f (news spike?)", size)
-            send_telegram(f"⚠️ US500 range too large: {size:.2f}pts — no trade today")
-            return None
+            send_telegram(f"?? US500 range too large: {size:.2f}pts ? no trade today")
+            return make_disabled_range(high, low, size, reason="too_large")
 
         # Pre-market bias: compare 08:00 price to 13:30 price
         candles_1h = broker.get_candles(epic, "HOUR", 8)
@@ -718,7 +731,7 @@ class ORBStrategy:
             logger.info("US500 pre-market bias: %.3f%% → %s",
                         drift*100, bias or "NEUTRAL")
 
-        rng = {"high": high, "low": low, "size": size, "bias": bias}
+        rng = {"high": high, "low": low, "size": size, "bias": bias, "disabled": False}
         db_save_range("US500", high, low, bias)
 
         send_telegram(
@@ -818,17 +831,17 @@ class ARBStrategy:
 
         if size < ARB_MIN_RANGE:
             logger.info("%s: Asian range too small %.5f", pair, size)
-            send_telegram(f"⚠️ {pair} Asian range too small: "
-                          f"{round(size*10000,1)}pips — no trade today")
-            return None
+            send_telegram(f"?? {pair} Asian range too small: "
+                          f"{round(size*10000,1)}pips ? no trade today")
+            return make_disabled_range(high, low, size, reason="too_small")
 
         if size > ARB_MAX_RANGE:
             logger.info("%s: Asian range too large %.5f", pair, size)
-            send_telegram(f"⚠️ {pair} Asian range too large: "
-                          f"{round(size*10000,1)}pips — likely news — no trade")
-            return None
+            send_telegram(f"?? {pair} Asian range too large: "
+                          f"{round(size*10000,1)}pips ? likely news ? no trade")
+            return make_disabled_range(high, low, size, reason="too_large")
 
-        rng = {"high": high, "low": low, "size": size, "bias": ""}
+        rng = {"high": high, "low": low, "size": size, "bias": "", "disabled": False}
         db_save_range(pair, high, low)
 
         send_telegram(
@@ -907,11 +920,11 @@ class PDBStrategy:
 
         if size < PDB_MIN_RANGE:
             logger.info("USDJPY: previous day range too small %.3f", size)
-            return None
+            return make_disabled_range(high, low, size, reason="too_small")
 
         if size > PDB_MAX_RANGE:
             logger.info("USDJPY: previous day range too large %.3f", size)
-            return None
+            return make_disabled_range(high, low, size, reason="too_large")
 
         rng = {"high": high, "low": low, "size": size, "bias": ""}
         db_save_range("USDJPY", high, low)
@@ -1436,6 +1449,9 @@ def scan_orb(live: Dict):
     if not rng:
         return
 
+    if rng.get("disabled"):
+        return
+
     direction = orb.check_entry(live, rng)
     if not direction:
         return
@@ -1455,6 +1471,9 @@ def scan_arb(pair: str, live: Dict):
     if not rng:
         return
 
+    if rng.get("disabled"):
+        return
+
     direction = arb.check_entry(live, rng)
     if not direction:
         return
@@ -1472,6 +1491,9 @@ def scan_pdb(live: Dict):
 
     rng = ranges.get("USDJPY")
     if not rng:
+        return
+
+    if rng.get("disabled"):
         return
 
     direction = pdb.check_entry(live, rng)
