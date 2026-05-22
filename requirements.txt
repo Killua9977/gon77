@@ -1,4 +1,1 @@
-pandas
-numpy
-requests
-scikit-learn
+requests>=2.31.0,<3.0.0
