@@ -27,7 +27,7 @@ import os
 import sqlite3
 import time
 from datetime import datetime, timezone, timedelta
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Set, Tuple
 
 import requests
 
@@ -79,9 +79,12 @@ PDB_MAX_RANGE    = float(os.getenv("PDB_MAX_RANGE",  "2.00"))   # 200 pip max
 SCAN_INTERVAL    = int(os.getenv("SCAN_INTERVAL",    "10"))
 HEARTBEAT_SECS   = int(os.getenv("HEARTBEAT_SECS",  "1800"))
 
-DB_FILE      = "multi_state.db"
-RESULTS_FILE = "multi_results.csv"
-LOG_FILE     = "multi_bot.log"
+DATA_DIR = os.getenv("DATA_DIR", ".").strip() or "."
+os.makedirs(DATA_DIR, exist_ok=True)
+
+DB_FILE      = os.path.join(DATA_DIR, "multi_state.db")
+RESULTS_FILE = os.path.join(DATA_DIR, "multi_results.csv")
+LOG_FILE     = os.path.join(DATA_DIR, "multi_bot.log")
 
 # Instrument map
 PAIRS = {
@@ -90,6 +93,19 @@ PAIRS = {
     "GBPUSD": {"search": "GBPUSD",  "strategy": "ARB",       "decimals": 5},
     "USDJPY": {"search": "USDJPY",  "strategy": "PDB",       "decimals": 3},
 }
+
+PAIR_NEWS_CURRENCIES = {
+    "EURUSD": {"EUR", "USD"},
+    "GBPUSD": {"GBP", "USD"},
+    "USDJPY": {"USD", "JPY"},
+}
+
+US500_NEWS_KEYWORDS = (
+    "fomc", "fed", "powell", "interest rate", "cpi", "inflation",
+    "ppi", "pce", "payroll", "non-farm", "nfp", "unemployment",
+    "jobless", "gdp", "retail sales", "ism", "pmi", "jolts",
+    "consumer confidence", "minutes", "rate decision"
+)
 
 # ================== Logging ================================================
 logging.basicConfig(
@@ -164,9 +180,13 @@ def fetch_news() -> List[Dict]:
             if item.get("impact","").lower() not in {"high","medium"}:
                 continue
             try:
-                t = datetime.fromisoformat(item["date"].replace("Z","+00:00"))
-                events.append({"time": t, "title": item.get("title",""),
-                                "impact": item.get("impact","")})
+                t = datetime.fromisoformat(item["date"].replace("Z","+00:00")).astimezone(timezone.utc)
+                events.append({
+                    "time": t,
+                    "title": item.get("title",""),
+                    "impact": item.get("impact",""),
+                    "country": item.get("country","").upper(),
+                })
             except Exception:
                 continue
         _news_cache = events
@@ -176,11 +196,33 @@ def fetch_news() -> List[Dict]:
         logger.warning("News fetch failed: %s", e)
         return _news_cache
 
-def is_near_news() -> bool:
+def event_affects_pair(pair: str, event: Dict) -> bool:
+    country = event.get("country", "").upper()
+    impact = event.get("impact", "").lower()
+    title = event.get("title", "").lower()
+
+    if pair == "US500":
+        if country == "ALL":
+            return impact == "high"
+        if country != "USD":
+            return False
+        return impact == "high" or any(keyword in title for keyword in US500_NEWS_KEYWORDS)
+
+    currencies = PAIR_NEWS_CURRENCIES.get(pair, set())
+    return country == "ALL" or country in currencies
+
+
+def is_near_news(pair: Optional[str] = None) -> bool:
     now = now_utc()
     for event in fetch_news():
+        if pair and not event_affects_pair(pair, event):
+            continue
         if abs((event["time"] - now).total_seconds()) <= NEWS_BUFFER_MINS * 60:
-            logger.info("News blackout: %s (%s)", event["title"], event["impact"])
+            label = pair or "GLOBAL"
+            logger.info(
+                "%s news blackout: %s [%s/%s]",
+                label, event["title"], event.get("country", "?"), event["impact"]
+            )
             return True
     return False
 
@@ -202,6 +244,8 @@ def init_db():
         direction TEXT, entry REAL, sl REAL, tp1 REAL, tp2 REAL,
         range_high REAL, range_low REAL, range_size REAL,
         lot_size REAL, deal_ref TEXT, deal_id TEXT,
+        initial_sl REAL DEFAULT 0, broker_sl REAL DEFAULT 0,
+        risk_per_unit REAL DEFAULT 0,
         status TEXT DEFAULT 'OPEN', result TEXT DEFAULT '',
         exit_price REAL, exit_reason TEXT DEFAULT '',
         opened_at REAL, closed_at REAL,
@@ -215,6 +259,18 @@ def init_db():
         realized_pnl REAL DEFAULT 0,
         trade_count INTEGER DEFAULT 0
     )""")
+    existing_cols = {
+        row[1] for row in c.execute("PRAGMA table_info(trades)").fetchall()
+    }
+    for col_name, col_type, default in [
+        ("initial_sl", "REAL", "0"),
+        ("broker_sl", "REAL", "0"),
+        ("risk_per_unit", "REAL", "0"),
+    ]:
+        if col_name not in existing_cols:
+            c.execute(
+                f"ALTER TABLE trades ADD COLUMN {col_name} {col_type} DEFAULT {default}"
+            )
     conn.commit()
     conn.close()
 
@@ -246,13 +302,15 @@ def db_save_trade(trade: Dict) -> int:
     c.execute("""INSERT INTO trades
         (pair, strategy, trade_date, direction, entry, sl, tp1, tp2,
          range_high, range_low, range_size, lot_size, deal_ref, deal_id,
-         status, opened_at)
-        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+         initial_sl, broker_sl, risk_per_unit, status, opened_at)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
         (trade["pair"], trade["strategy"], today_str(),
          trade["direction"], trade["entry"], trade["sl"],
          trade["tp1"], trade["tp2"], trade["range_high"], trade["range_low"],
          trade["range_size"], trade["lot_size"], trade.get("deal_ref",""),
-         trade.get("deal_id",""), "OPEN", trade["opened_at"]))
+         trade.get("deal_id",""), trade.get("initial_sl", trade["sl"]),
+         trade.get("broker_sl", trade["sl"]), trade.get("risk_per_unit", 0),
+         "OPEN", trade["opened_at"]))
     row_id = c.lastrowid
     conn.commit()
     conn.close()
@@ -262,12 +320,16 @@ def db_update_trade(trade: Dict):
     conn = sqlite3.connect(DB_FILE)
     conn.execute("""UPDATE trades SET sl=?, status=?, result=?,
         exit_price=?, exit_reason=?, closed_at=?, pnl=?,
-        profit_r=?, tp1_locked=?, deal_id=? WHERE id=?""",
+        profit_r=?, tp1_locked=?, deal_id=?, deal_ref=?, broker_sl=?,
+        initial_sl=?, risk_per_unit=? WHERE id=?""",
         (trade["sl"], trade["status"], trade.get("result",""),
          trade.get("exit_price"), trade.get("exit_reason",""),
          trade.get("closed_at"), trade.get("pnl",0),
          trade.get("profit_r",0), int(trade.get("tp1_locked",False)),
-         trade.get("deal_id",""), trade["db_id"]))
+         trade.get("deal_id",""), trade.get("deal_ref",""),
+         trade.get("broker_sl", trade["sl"]),
+         trade.get("initial_sl", trade["sl"]), trade.get("risk_per_unit", 0),
+         trade["db_id"]))
     conn.commit()
     conn.close()
 
@@ -282,6 +344,12 @@ def db_load_open_trades() -> List[Dict]:
     for row in rows:
         d = dict(zip(cols, row))
         d["tp1_locked"] = bool(d.get("tp1_locked",0))
+        if not d.get("initial_sl"):
+            d["initial_sl"] = d["sl"]
+        if not d.get("broker_sl"):
+            d["broker_sl"] = d["sl"]
+        if not d.get("risk_per_unit"):
+            d["risk_per_unit"] = abs(d["entry"] - d["initial_sl"])
         result.append(d)
     return result
 
@@ -558,20 +626,34 @@ class CapitalClient:
         return 0.0
 
 # ================== Shared Utilities ======================================
+def get_point_value(pair: str) -> float:
+    """Approximate quote-currency PnL per 1.0 price move for one unit."""
+    if pair == "US500":
+        return 1.0
+    return 1.0
+
 def calculate_lot_size(pair: str, equity: float,
                        entry: float, sl: float) -> float:
-    """Risk RISK_PERCENT% of equity. Enforces instrument min/max."""
+    """Risk RISK_PERCENT% of equity using per-instrument point value."""
     risk_amt = equity * (RISK_PERCENT / 100)
     sl_dist  = abs(entry - sl)
-    if sl_dist <= 0:
+    point_value = get_point_value(pair)
+    if sl_dist <= 0 or point_value <= 0:
         return 0.0
-    size = round(risk_amt / sl_dist, 2)
+    size = round(risk_amt / (sl_dist * point_value), 2)
     # Min/max per instrument
     minimums = {"US500": 1, "EURUSD": 1000, "GBPUSD": 1000, "USDJPY": 1000}
     maximums = {"US500": 100, "EURUSD": 50000, "GBPUSD": 50000, "USDJPY": 50000}
     size = max(size, minimums.get(pair, 1000))
     size = min(size, maximums.get(pair, 50000))
     return size
+
+def calculate_trade_pnl(pair: str, direction: str,
+                        entry: float, exit_price: float,
+                        lot_size: float) -> float:
+    move = ((exit_price - entry) if direction == "BUY"
+            else (entry - exit_price))
+    return round(move * lot_size * get_point_value(pair), 2)
 
 # ================== Strategy 1: ORB (US500) ================================
 class ORBStrategy:
@@ -604,10 +686,8 @@ class ORBStrategy:
             except Exception:
                 continue
 
-        if not range_candles:
-            range_candles = candles_5m[-6:]
-
-        if len(range_candles) < 2:
+        if len(range_candles) < 4:
+            logger.warning("US500: incomplete 13:30-14:00 candle set (%s candles)", len(range_candles))
             return None
 
         high = round(max(c["high"] for c in range_candles), 1)
@@ -892,6 +972,7 @@ open_trades:  List[Dict]              = []
 epics:        Dict[str, str]          = {}
 ranges:       Dict[str, Dict]         = {}
 ranges_built: Dict[str, bool]         = {p: False for p in PAIRS}
+blocked_pairs: Set[str]               = set()
 wins = losses = breakevens            = 0
 
 orb = ORBStrategy()
@@ -927,11 +1008,15 @@ def save_result(trade: Dict, result: str,
     global wins, losses, breakevens
 
     decimals = PAIRS[trade["pair"]]["decimals"]
-    sl_dist  = abs(trade["entry"] - trade["sl"])
+    risk_per_unit = trade.get("risk_per_unit") or abs(
+        trade["entry"] - trade.get("initial_sl", trade["sl"])
+    )
     pnl_dir  = ((exit_price - trade["entry"]) if trade["direction"]=="BUY"
                 else (trade["entry"] - exit_price))
-    pnl      = round(pnl_dir * trade["lot_size"], 2)
-    profit_r = round(pnl_dir / sl_dist, 2) if sl_dist else 0
+    pnl      = calculate_trade_pnl(
+        trade["pair"], trade["direction"], trade["entry"], exit_price, trade["lot_size"]
+    )
+    profit_r = round(pnl_dir / risk_per_unit, 2) if risk_per_unit else 0
 
     with open(RESULTS_FILE, "a", newline="", encoding="utf-8") as f:
         csv.writer(f).writerow([
@@ -962,24 +1047,25 @@ def finalize_trade(trade: Dict, exit_price: float,
 
     if broker_close and broker:
         identifier = trade.get("deal_id") or trade.get("deal_ref","")
-        # Pass epic as fallback so broker can find position even if dealId is wrong
         epic_fb = epics.get(trade.get("pair",""), "")
         closed  = broker.close_position(identifier, epic_fb)
         if not closed:
             logger.error(
-                "CLOSE FAILED for %s — position may still be open on broker!",
+                "CLOSE FAILED for %s - position may still be open on broker!",
                 trade.get("pair","")
             )
             send_telegram(
-                f"⚠️ Close failed for {trade.get('pair','')} "
-                f"{trade.get('direction','')}\n"
+                f"Close failed for {trade.get('pair','')} {trade.get('direction','')}\n"
                 f"Please close manually on Capital.com!"
             )
+            return
 
-    sl_dist  = abs(trade["entry"] - trade["sl"])
+    risk_per_unit = trade.get("risk_per_unit") or abs(
+        trade["entry"] - trade.get("initial_sl", trade["sl"])
+    )
     pnl_dir  = ((exit_price - trade["entry"]) if trade["direction"]=="BUY"
                 else (trade["entry"] - exit_price))
-    profit_r = pnl_dir / sl_dist if sl_dist else 0
+    profit_r = pnl_dir / risk_per_unit if risk_per_unit else 0
     result   = ("WIN" if profit_r > 0.1
                 else ("LOSS" if profit_r < -0.1 else "BE"))
 
@@ -989,7 +1075,9 @@ def finalize_trade(trade: Dict, exit_price: float,
         "exit_price":  exit_price,
         "exit_reason": reason,
         "closed_at":   time.time(),
-        "pnl":         round(pnl_dir * trade["lot_size"], 2),
+        "pnl":         calculate_trade_pnl(
+            trade["pair"], trade["direction"], trade["entry"], exit_price, trade["lot_size"]
+        ),
         "profit_r":    round(profit_r, 2),
     })
     db_update_trade(trade)
@@ -998,48 +1086,195 @@ def finalize_trade(trade: Dict, exit_price: float,
                 trade["pair"], trade["direction"],
                 exit_price, result, reason)
 
-def update_sl_broker(trade: Dict, new_sl: float):
+def update_sl_broker(trade: Dict, new_sl: float) -> bool:
     if not broker:
-        return
+        return False
     decimals   = PAIRS[trade["pair"]]["decimals"]
     identifier = trade.get("deal_id") or trade.get("deal_ref","")
     epic_fb    = epics.get(trade.get("pair",""), "")
 
-    # Try with stored identifier first
     if identifier:
         success = broker.update_sl(identifier, new_sl, decimals)
         if success:
-            return
+            trade["broker_sl"] = new_sl
+            db_update_trade(trade)
+            return True
 
-    # Fallback: resolve by epic and update
     if epic_fb:
         logger.warning(
-            "%s: SL update by identifier failed — trying epic fallback",
+            "%s: SL update by identifier failed - trying epic fallback",
             trade.get("pair","")
         )
         pos = broker._resolve("", epic_fb)
         if pos and pos.get("dealId"):
-            # Store the correct dealId for future operations
             trade["deal_id"] = pos["dealId"]
-            db_update_trade(trade)
-            result = broker._req("PUT",
+            result = broker._req(
+                "PUT",
                 f"/api/v1/positions/{pos['dealId']}",
                 {"stopLevel": float(round(new_sl, decimals))}
             )
             if result:
-                logger.info("%s SL updated via epic fallback → %.5f",
+                trade["broker_sl"] = new_sl
+                db_update_trade(trade)
+                logger.info("%s SL updated via epic fallback -> %.5f",
                             trade.get("pair",""), new_sl)
-            else:
-                logger.error("%s SL update failed completely",
-                             trade.get("pair",""))
+                return True
+            logger.error("%s SL update failed completely",
+                         trade.get("pair",""))
+    return False
+
+def pair_from_epic(epic: str) -> Optional[str]:
+    epic_upper = epic.upper()
+    for pair, mapped_epic in epics.items():
+        if mapped_epic.upper() == epic_upper:
+            return pair
+    return None
+
+
+def find_matching_broker_position(trade: Dict, broker_positions: List[Dict]) -> Optional[Dict]:
+    identifiers = {trade.get("deal_id", ""), trade.get("deal_ref", "")}
+    identifiers.discard("")
+    for pos in broker_positions:
+        if (pos.get("dealId", "") in identifiers or
+                pos.get("dealReference", "") in identifiers):
+            return pos
+
+    pair_epic = epics.get(trade["pair"], "").upper()
+    if not pair_epic:
+        return None
+
+    candidates = [
+        pos for pos in broker_positions
+        if pos.get("epic", "").upper() == pair_epic
+        and pos.get("direction", "").upper() == trade["direction"].upper()
+    ]
+    if len(candidates) == 1:
+        return candidates[0]
+    if len(candidates) > 1:
+        logger.warning("%s: multiple broker positions match the local trade", trade["pair"])
+    return None
+
+
+def close_trade_as_unknown(trade: Dict, reason: str, exit_price: Optional[float] = None):
+    if trade["status"] != "OPEN":
+        return
+
+    exit_value = trade["entry"] if exit_price is None else exit_price
+    trade.update({
+        "status": "CLOSED",
+        "result": "UNKNOWN",
+        "exit_price": exit_value,
+        "exit_reason": reason,
+        "closed_at": time.time(),
+        "pnl": 0,
+        "profit_r": 0,
+    })
+    db_update_trade(trade)
+
+    with open(RESULTS_FILE, "a", newline="", encoding="utf-8") as f:
+        csv.writer(f).writerow([
+            now_utc().isoformat(), trade["pair"], trade["strategy"],
+            trade["direction"], trade["entry"], trade["sl"],
+            trade["tp1"], trade["tp2"], exit_value, "UNKNOWN",
+            0, 0, trade["range_size"], reason
+        ])
+
+    logger.warning("Closed %s locally as UNKNOWN (%s)", trade["pair"], reason)
+
+
+def reconcile_state_with_broker():
+    global blocked_pairs
+
+    if not broker:
+        return
+
+    blocked_pairs.clear()
+    broker_positions = broker.get_open_positions()
+    matched_ids: Set[str] = set()
+    matched_refs: Set[str] = set()
+
+    for trade in [t for t in open_trades if t["status"] == "OPEN"]:
+        pos = find_matching_broker_position(trade, broker_positions)
+        if not pos:
+            live = None
+            epic = epics.get(trade["pair"], "")
+            if epic:
+                live = broker.get_live_price(epic)
+            exit_price = None
+            if live:
+                exit_price = live["bid"] if trade["direction"] == "BUY" else live["ask"]
+            close_trade_as_unknown(trade, "BROKER_POSITION_MISSING", exit_price)
+            send_telegram(
+                f"Startup reconciliation closed local {trade['pair']} {trade['direction']}\n"
+                f"No matching broker position was found. Result marked UNKNOWN."
+            )
+            continue
+
+        deal_id = pos.get("dealId", "")
+        deal_ref = pos.get("dealReference", "")
+        if deal_id:
+            matched_ids.add(deal_id)
+        if deal_ref:
+            matched_refs.add(deal_ref)
+
+        updated = False
+        if deal_id and trade.get("deal_id") != deal_id:
+            trade["deal_id"] = deal_id
+            updated = True
+        if deal_ref and trade.get("deal_ref") != deal_ref:
+            trade["deal_ref"] = deal_ref
+            updated = True
+
+        stop_level = pos.get("stopLevel")
+        if stop_level is not None:
+            try:
+                broker_sl = float(stop_level)
+                if trade.get("broker_sl") != broker_sl:
+                    trade["broker_sl"] = broker_sl
+                    updated = True
+            except (TypeError, ValueError):
+                pass
+
+        if updated:
+            db_update_trade(trade)
+
+    for pos in broker_positions:
+        deal_id = pos.get("dealId", "")
+        deal_ref = pos.get("dealReference", "")
+        if (deal_id and deal_id in matched_ids) or (deal_ref and deal_ref in matched_refs):
+            continue
+
+        pair = pair_from_epic(pos.get("epic", ""))
+        label = pair or pos.get("epic", "UNKNOWN")
+        if pair:
+            blocked_pairs.add(pair)
+
+        logger.warning(
+            "Untracked broker position detected: %s %s size=%s deal=%s",
+            label, pos.get("direction", ""), pos.get("size", 0), deal_id or deal_ref
+        )
+        send_telegram(
+            f"Untracked broker position detected\n"
+            f"Instrument: {label}\n"
+            f"Direction: {pos.get('direction', '')}\n"
+            f"Size: {pos.get('size', 0)}\n"
+            f"Deal ID: {deal_id or deal_ref}\n"
+            f"This pair is blocked from new trades until you close it or restart after syncing."
+        )
+
+    logger.info(
+        "Startup reconciliation complete: local_open=%s broker_open=%s blocked_pairs=%s",
+        sum(1 for t in open_trades if t["status"] == "OPEN"),
+        len(broker_positions),
+        ",".join(sorted(blocked_pairs)) or "none"
+    )
+
 
 def check_trades(live_prices: Dict[str, Dict]):
     """
     Monitor all open trades.
-    Auto-moving SL system:
-      Price hits TP1 → SL moves to TP1 (risk-free)
-      Price hits TP2 → close = full WIN
-      Price hits SL  → close = LOSS (or win if SL > entry)
+    Internal logical SL can differ from the broker stop after TP1,
+    so broker closes are always explicit when the bot decides the trade is done.
     """
     for trade in [t for t in open_trades if t["status"]=="OPEN"]:
         pair  = trade["pair"]
@@ -1052,10 +1287,10 @@ def check_trades(live_prices: Dict[str, Dict]):
 
         # ── SL hit ──────────────────────────────────────────────────────
         if trade["direction"]=="BUY"  and price <= trade["sl"]:
-            finalize_trade(trade, price, "SL", broker_close=False)
+            finalize_trade(trade, price, "SL", broker_close=True)
             continue
         if trade["direction"]=="SELL" and price >= trade["sl"]:
-            finalize_trade(trade, price, "SL", broker_close=False)
+            finalize_trade(trade, price, "SL", broker_close=True)
             continue
 
         # ── TP2 hit → close ─────────────────────────────────────────────
@@ -1071,22 +1306,20 @@ def check_trades(live_prices: Dict[str, Dict]):
             tp1_hit = ((trade["direction"]=="BUY"  and price >= trade["tp1"])
                     or (trade["direction"]=="SELL" and price <= trade["tp1"]))
             if tp1_hit:
-                # Internal SL = exact TP1 level (for bot tracking)
                 new_sl = round(trade["tp1"], decimals)
                 trade["sl"]         = new_sl
                 trade["tp1_locked"] = True
-                db_update_trade(trade)
 
-                # Broker SL = TP1 minus small buffer to avoid
-                # "error.invalid.stoploss.maxvalue" rejection
-                # Capital.com requires SL to be a few pips below current price
                 pip = 0.0001 if pair != "USDJPY" else 0.01
-                if pair == "US500": pip = 1.0
+                if pair == "US500":
+                    pip = 1.0
                 broker_sl = round(
                     new_sl - pip * 3 if trade["direction"]=="BUY"
                     else new_sl + pip * 3,
                     decimals
                 )
+                trade["broker_sl"] = broker_sl
+                db_update_trade(trade)
                 update_sl_broker(trade, broker_sl)
                 logger.info("%s TP1 locked: SL → %.5f (broker=%.5f)",
                             pair, new_sl, broker_sl)
@@ -1122,7 +1355,10 @@ def open_trade(pair: str, direction: str, entry: float,
     if get_daily_loss_pct() >= DAILY_LOSS_LIMIT_PCT:
         logger.warning("Daily loss limit — no new trades")
         return
-    if is_near_news():
+    if pair in blocked_pairs:
+        logger.warning("%s: blocked from new trades due to untracked broker position", pair)
+        return
+    if is_near_news(pair):
         logger.info("News blackout — skipping %s entry", pair)
         return
 
@@ -1150,6 +1386,9 @@ def open_trade(pair: str, direction: str, entry: float,
         "direction":  direction,
         "entry":      entry,
         "sl":         sl,
+        "initial_sl": sl,
+        "broker_sl":  sl,
+        "risk_per_unit": abs(entry - sl),
         "tp1":        tp1,
         "tp2":        tp2,
         "range_high": rng["high"],
@@ -1244,49 +1483,40 @@ def scan_pdb(live: Dict):
     open_trade("USDJPY", direction, entry, sl, tp1, tp2, rng, "PDB")
 
 def build_daily_ranges():
-    """Build ranges for all strategies at the right times."""
+    """Build ranges once the required source session has actually completed."""
     now = now_utc()
     if now.weekday() >= 5:
         return
 
     c = cur_mins()
 
-    # ── ORB range (US500) — build right after 14:00 UTC ─────────────────
-    if (not ranges_built["US500"]
-            and c >= mins(14,0)
-            and c < mins(14,5)):
+    if not ranges_built["US500"] and c >= mins(*ORB_RANGE_END):
         epic = epics.get("US500")
         if epic:
             logger.info("Building US500 ORB range...")
             rng = orb.build_range(epic)
             if rng:
-                ranges["US500"]       = rng
+                ranges["US500"] = rng
                 ranges_built["US500"] = True
 
-    # ── ARB ranges (EURUSD, GBPUSD) — build right at 07:00 UTC ─────────
-    for pair in ["EURUSD","GBPUSD"]:
-        if (not ranges_built[pair]
-                and c >= mins(7,0)
-                and c < mins(7,5)):
+    for pair in ["EURUSD", "GBPUSD"]:
+        if not ranges_built[pair] and c >= mins(*ARB_RANGE_END):
             epic = epics.get(pair)
             if epic:
                 logger.info("Building %s Asian range...", pair)
                 rng = arb.build_range(pair, epic)
                 if rng:
-                    ranges[pair]       = rng
+                    ranges[pair] = rng
                     ranges_built[pair] = True
-            time.sleep(1)
+                time.sleep(1)
 
-    # ── PDB range (USDJPY) — build at 07:05 UTC ──────────────────────────
-    if (not ranges_built["USDJPY"]
-            and c >= mins(7,5)
-            and c < mins(7,10)):
+    if not ranges_built["USDJPY"] and c >= mins(*PDB_TRADE_START):
         epic = epics.get("USDJPY")
         if epic:
             logger.info("Building USDJPY previous day range...")
             rng = pdb.build_range(epic)
             if rng:
-                ranges["USDJPY"]       = rng
+                ranges["USDJPY"] = rng
                 ranges_built["USDJPY"] = True
 
 # ================== Heartbeat =============================================
@@ -1347,6 +1577,8 @@ def main():
         else:
             logger.error("Cannot resolve epic for %s", pair)
 
+    reconcile_state_with_broker()
+
     start_bal = broker.get_account_balance()
     init_daily_pnl(start_bal if start_bal > 0 else INITIAL_EQUITY)
 
@@ -1380,6 +1612,8 @@ def main():
                     ranges_built[pair] = False
                 ranges.clear()
                 last_day = today_str()
+                day_start_equity = broker.get_account_balance() if broker else INITIAL_EQUITY
+                init_daily_pnl(day_start_equity if day_start_equity > 0 else INITIAL_EQUITY)
                 logger.info("New trading day: %s", last_day)
 
             # ── Build ranges at correct times ─────────────────────────────
