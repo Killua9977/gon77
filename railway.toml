@@ -1,2 +1,2 @@
 [deploy]
-startCommand = "python strategy_v1.py"
+startCommand = "python multi_strategy_bot_report_tuned.py"
