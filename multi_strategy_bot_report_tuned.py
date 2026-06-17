@@ -7,32 +7,32 @@ import multi_strategy_bot_fixed as bot
 
 
 REPORT_TUNING_NOTES: Dict[str, str] = {
-    "US500": "Disabled by default from report: -AED171.13, PF 0.34, win rate 33.3%",
-    "EURUSD": "Disabled by default from report: -AED164.49, PF 0.45, win rate 35.7%",
-    "GBPUSD": "Kept on reduced risk: -AED41.62, PF 0.82, skip Monday/Wednesday and cut stale trades early",
-    "USDJPY": "Priority pair: +AED4.04, PF 1.33, best market in the report",
+    "US500": "Thu only, bias required. Data: -AED171.13 PF 0.34. Both losses on Mon/Wed, only win on Thu.",
+    "EURUSD": "Tue/Thu only, trade_end 10:30. Data: Tue/Thu +AED84 67%WR vs other days -AED249 12%WR. Exits at 12:00 forced lost 9/9.",
+    "GBPUSD": "Tue/Thu/Fri only, trade_end 10:30. Data: Tue/Thu/Fri +AED97 56%WR vs Mon/Wed -AED138 20%WR.",
+    "USDJPY": "Priority pair, all days. Data: +AED4.04 PF 1.33. Consistent across weekdays.",
 }
 
 
 PAIR_ENABLED: Dict[str, bool] = {
-    "US500": bot.env_bool("ENABLE_US500", False),
-    "EURUSD": bot.env_bool("ENABLE_EURUSD", False),
+    "US500": bot.env_bool("ENABLE_US500", True),
+    "EURUSD": bot.env_bool("ENABLE_EURUSD", True),
     "GBPUSD": bot.env_bool("ENABLE_GBPUSD", True),
     "USDJPY": bot.env_bool("ENABLE_USDJPY", True),
 }
 
 PAIR_RISK_MULTIPLIER: Dict[str, float] = {
-    "US500": bot.env_float("US500_RISK_MULT", 0.0),
-    "EURUSD": bot.env_float("EURUSD_RISK_MULT", 0.0),
-    "GBPUSD": bot.env_float("GBPUSD_RISK_MULT", 0.40),
-    "USDJPY": bot.env_float("USDJPY_RISK_MULT", 0.75),
+    "US500": bot.env_float("US500_RISK_MULT", 0.10),   # reduced: only 3 trades, very high variance
+    "EURUSD": bot.env_float("EURUSD_RISK_MULT", 0.20), # reduced: still losing, restricted to Tue/Thu
+    "GBPUSD": bot.env_float("GBPUSD_RISK_MULT", 0.30), # reduced: now restricted to Tue/Thu/Fri
+    "USDJPY": bot.env_float("USDJPY_RISK_MULT", 0.75), # unchanged: only profitable pair
 }
 
 PAIR_EARLY_BE_R: Dict[str, float] = {
     "US500": bot.env_float("US500_EARLY_BE_R", 0.0),
-    "EURUSD": bot.env_float("EURUSD_EARLY_BE_R", 0.0),
-    "GBPUSD": bot.env_float("GBPUSD_EARLY_BE_R", 0.60),
-    "USDJPY": bot.env_float("USDJPY_EARLY_BE_R", 0.70),
+    "EURUSD": bot.env_float("EURUSD_EARLY_BE_R", 0.50), # added: protect profits early, exits cluster around 09-10 UTC on wins
+    "GBPUSD": bot.env_float("GBPUSD_EARLY_BE_R", 0.50), # lowered from 0.60: lock in faster given short trade window
+    "USDJPY": bot.env_float("USDJPY_EARLY_BE_R", 0.70), # unchanged
 }
 
 PAIR_REENTRY_EXIT_MINS: Dict[str, int] = {
@@ -44,23 +44,24 @@ PAIR_REENTRY_EXIT_MINS: Dict[str, int] = {
 
 PAIR_STALE_CUTOFF: Dict[str, Optional[Tuple[int, int]]] = {
     "US500": None,
-    "EURUSD": None,
-    "GBPUSD": (10, 30),
+    "EURUSD": (10, 0),  # added: data shows wins exit by 10:30, losses drag to 12:00 forced close
+    "GBPUSD": (10, 0),  # tightened from 10:30: same pattern, wins resolve by 09-10 UTC
     "USDJPY": None,
 }
 
 PAIR_MIN_R_AT_CUTOFF: Dict[str, float] = {
     "US500": 0.0,
-    "EURUSD": 0.0,
-    "GBPUSD": bot.env_float("GBPUSD_MIN_R_AT_CUTOFF", 0.15),
+    "EURUSD": bot.env_float("EURUSD_MIN_R_AT_CUTOFF", 0.10), # added: if not at least 0.1R by 10:00, cut it
+    "GBPUSD": bot.env_float("GBPUSD_MIN_R_AT_CUTOFF", 0.20), # raised from 0.15: tighter given data
     "USDJPY": 0.0,
 }
 
 PAIR_ALLOWED_WEEKDAYS: Dict[str, Set[int]] = {
-    "US500": {0, 1, 2, 3, 4},
-    "EURUSD": {0, 1, 2, 3, 4},
-    "GBPUSD": {1, 3, 4},
-    "USDJPY": {0, 1, 2, 3, 4},
+    # 0=Mon 1=Tue 2=Wed 3=Thu 4=Fri
+    "US500": {3},           # Thu only — data: both losses Mon/Wed, only win Thu
+    "EURUSD": {1, 3},       # Tue/Thu only — data: +84 AED 67%WR vs -249 AED 12%WR on other days
+    "GBPUSD": {1, 3, 4},    # Tue/Thu/Fri — data: +97 AED 56%WR vs -138 AED 20%WR Mon/Wed
+    "USDJPY": {0, 1, 2, 3, 4},  # all days — consistent performer, no bad day pattern
 }
 
 
@@ -88,13 +89,13 @@ def configure_report_tuning():
         ),
         "GBPUSD": replace(
             bot.PAIR_CONFIGS["GBPUSD"],
-            trade_end=(11, 0),
+            trade_end=(10, 30),  # tightened from 11:00: data shows wins exit 08-09 UTC, 11:00 is still loss territory
             max_spread=bot.env_float("GBPUSD_MAX_SPREAD", 0.00018),
             buffer=bot.env_float("GBPUSD_BUFFER", 0.0004),
         ),
         "EURUSD": replace(
             bot.PAIR_CONFIGS["EURUSD"],
-            trade_end=(11, 0),
+            trade_end=(10, 30),  # tightened from 11:00: same pattern, 12:00 forced exits lost 9/9 in data
             max_spread=bot.env_float("EURUSD_MAX_SPREAD", 0.00018),
             buffer=bot.env_float("EURUSD_BUFFER", 0.0004),
         ),
@@ -141,7 +142,13 @@ def tuned_signal_for_pair(pair: str, live: Dict[str, float], trade_date: str):
         return None
     if not weekday_allowed(pair):
         return None
-    return _BASE_SIGNAL_FOR_PAIR(pair, live, trade_date)
+    signal = _BASE_SIGNAL_FOR_PAIR(pair, live, trade_date)
+    if not signal:
+        return None
+    if pair == "US500" and not signal["range"].get("bias"):
+        bot.logger.info("US500 skipped: no clear pre-market bias")
+        return None
+    return signal
 
 
 def live_profit_r(trade: Dict[str, object], price: float) -> float:
